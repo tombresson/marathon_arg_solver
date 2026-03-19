@@ -12,6 +12,7 @@ from matchtile.config import MatchTileConfig
 from matchtile.models import Calibration, CellObservation, MatchGroup, Point, ReconstructionResult, Rect
 from matchtile.vision import (
     CellFrameSample,
+    ReconstructionOptions,
     TileFeature,
     _build_hidden_reference,
     _build_feature,
@@ -255,6 +256,48 @@ class VisionTests(unittest.TestCase):
         self.assertEqual(Path(result.candidate_debug_path or ""), session_dir / "candidate_debug.png")
         self.assertGreater(len(result.observations), 50)
         self.assertGreaterEqual(len(result.groups), 2)
+
+    def test_reconstruct_from_images_live_fast_skips_heavy_artifacts_and_samples_every_other_frame(self) -> None:
+        config = MatchTileConfig(frame_stability_threshold=12.0, tile_match_threshold=0.72, group_confidence_threshold=0.80)
+        calibration = build_manual_calibration(
+            image_size=(40, 40),
+            rows=1,
+            cols=1,
+            corners=[Point(0.0, 0.0), Point(40.0, 0.0), Point(40.0, 40.0), Point(0.0, 40.0)],
+            group_size=3,
+        )
+        tile = np.full((40, 40, 3), (210, 70, 40), dtype=np.uint8)
+        cv2.circle(tile, (20, 20), 9, (15, 15, 15), -1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session_dir = Path(tmp)
+            image_paths: list[Path] = []
+            for index in range(4):
+                path = session_dir / f"frame_{index:04d}.png"
+                cv2.imwrite(str(path), tile)
+                image_paths.append(path)
+
+            result = reconstruct_from_images(
+                image_paths,
+                session_dir=session_dir,
+                config=config,
+                calibration=calibration,
+                options=ReconstructionOptions.live_fast(),
+            )
+
+            self.assertIsNone(result.grid_fit_debug_path)
+            self.assertIsNone(result.candidate_debug_path)
+            self.assertFalse((session_dir / "grid_fit_debug.png").exists())
+            self.assertFalse((session_dir / "candidate_debug.png").exists())
+            self.assertEqual(Path(result.grid_composed_path or ""), session_dir / "grid_composed.png")
+            self.assertEqual(Path(result.grid_debug_path or ""), session_dir / "grid_debug.png")
+            self.assertTrue((session_dir / "grid_composed.png").exists())
+            self.assertTrue((session_dir / "grid_debug.png").exists())
+            self.assertIn("r00c00", result.observations)
+            self.assertEqual(result.observations["r00c00"].frame_index, 0)
+            self.assertTrue(Path(result.observations["r00c00"].crop_path or "").exists())
+            self.assertEqual(result.observations["r00c00"].alternate_candidates, [])
+            self.assertEqual(result.observations["r00c00"].discarded_candidates, [])
 
     def test_session_regression_uses_manual_calibration_dimensions(self) -> None:
         session_frames = ROOT / "sessions" / "20260319-024228" / "frames"

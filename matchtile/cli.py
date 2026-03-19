@@ -23,6 +23,7 @@ from matchtile.phantom_board import (
 from matchtile.runtime_control import AbortRequested, StopToken
 from matchtile.session import create_session_dir
 from matchtile.vision import (
+    ReconstructionOptions,
     build_manual_calibration,
     edit_calibration,
     load_image,
@@ -384,12 +385,17 @@ def cmd_arm(args: argparse.Namespace, config: MatchTileConfig, config_load: Conf
             ),
             encoding="utf-8",
         )
-        print(f"Reconstructing board from local reveal frames with group sizes 2-{max_group_size}...")
+        live_options = ReconstructionOptions.live_fast()
+        print(
+            f"Reconstructing board from local reveal frames with group sizes 2-{max_group_size} "
+            f"in fast mode (every {live_options.frame_stride}nd frame, reduced debug artifacts)..."
+        )
         result = reconstruct_from_session(
             session_dir,
             config,
             calibration=base_calibration,
             required_group_size=None,
+            options=live_options,
         )
         result.board_source = {
             "mode": "live-capture",
@@ -398,6 +404,8 @@ def cmd_arm(args: argparse.Namespace, config: MatchTileConfig, config_load: Conf
             "group_size": base_calibration.group_size,
             "max_group_size": max_group_size,
             "calibration_path": calibration_path,
+            "reconstruction_mode": live_options.mode,
+            "frame_stride": live_options.frame_stride,
             "captured_at": datetime.now(timezone.utc).isoformat(),
         }
         solve_order_path = _write_solve_order(result, session_dir)
@@ -408,6 +416,11 @@ def cmd_arm(args: argparse.Namespace, config: MatchTileConfig, config_load: Conf
             f"and reconstructed {len(result.groups)} group(s) up to size {max_group_size}."
         )
         print(f"Groups: {len(result.groups)} | Unresolved: {len(result.unresolved)}")
+        print(
+            "Fast live mode kept the composed/annotated grids but skipped the heavier "
+            "grid-fit, candidate-debug, and alternate crop dumps. "
+            f"Use `matchtile replay --session {session_dir}` to regenerate richer artifacts if needed."
+        )
         _print_group_summary(result)
         if result.grid_fit_debug_path:
             print(f"Grid fit debug: {result.grid_fit_debug_path}")

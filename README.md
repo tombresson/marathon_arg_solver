@@ -41,6 +41,7 @@ matchtile overlay --session sessions\20260319-013000 --window "NULL//TRANSMIT.ER
 - Live window calibrations are saved under `calibrations/` and reused automatically by `arm` for the same Discord client size.
 - `arm` no longer auto-calibrates. If no matching calibration exists, it stops and tells you to run `matchtile calibrate` first.
 - `arm` waits for `F8`, captures a fixed reveal burst from Discord, reconstructs the board locally, and uses the saved calibration profile's `rows`, `cols`, and max group size. A max group size of `3` allows both 2- and 3-matches; `4` allows 2-, 3-, and 4-matches.
+- Live `arm` runs now use a faster reconstruction path by default: every other frame is analyzed first, the composed and annotated grids are still written to the session, and only the heavier grid-fit/candidate-debug artifacts are skipped until replay.
 - Runtime settings come from [matchtile.json](e:/Sync/Projects/Marathon%20ARG/matchtile.json) when that file exists. Editing [config.py](e:/Sync/Projects/Marathon%20ARG/matchtile/config.py) only changes defaults for new or missing config values.
 - `arm` prints the active config file plus the effective `capture_fps` and `reveal_duration_s` at startup so you can confirm the live capture timing being used.
 - `replay --board-json` is still available for offline website-board debugging. `replay --session` uses `session\calibration.json` when present.

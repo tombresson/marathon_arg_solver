@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import combinations
 from pathlib import Path
@@ -876,6 +877,31 @@ class TileFeature:
     variant_descriptors: list[np.ndarray] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class ReconstructionOptions:
+    mode: str = "debug"
+    frame_stride: int = 1
+    write_primary_crops: bool = True
+    write_alternate_crops: bool = True
+    record_timelines: bool = True
+    generate_grid_artifacts: bool = True
+    generate_candidate_debug: bool = True
+    generate_grid_fit_debug: bool = True
+
+    @classmethod
+    def live_fast(cls) -> "ReconstructionOptions":
+        return cls(
+            mode="live-fast",
+            frame_stride=2,
+            write_primary_crops=True,
+            write_alternate_crops=False,
+            record_timelines=False,
+            generate_grid_artifacts=True,
+            generate_candidate_debug=False,
+            generate_grid_fit_debug=False,
+        )
+
+
 def _combine_feature_variant(
     descriptor: np.ndarray,
     shape_descriptor: np.ndarray | None,
@@ -1120,13 +1146,46 @@ def reconstruct_from_images(
     config: MatchTileConfig,
     calibration: Calibration,
     required_group_size: int | None = None,
+    options: ReconstructionOptions | None = None,
 ) -> ReconstructionResult:
-    images = [load_image(path) for path in image_paths]
-    if not images:
+    if not image_paths:
+        raise ValueError("No images provided for reconstruction.")
+    options = options or ReconstructionOptions()
+
+    indexed_paths = list(enumerate(image_paths))
+    if options.frame_stride > 1:
+        indexed_paths = indexed_paths[:: max(1, options.frame_stride)]
+    if not indexed_paths:
+        indexed_paths = [(0, image_paths[0])]
+
+    calibration_image: np.ndarray | None = None
+    samples_by_cell: dict[str, list[CellFrameSample]] = defaultdict(list)
+    cell_positions = [
+        (row, col, f"r{row:02d}c{col:02d}")
+        for row in range(calibration.rows)
+        for col in range(calibration.cols)
+    ]
+    for original_index, image_path in indexed_paths:
+        frame = load_image(image_path)
+        if calibration_image is None:
+            calibration_image = frame
+        board = warp_image_to_board(frame, calibration)
+        for row, col, cell_id in cell_positions:
+            crop = _cell_crop(board, calibration, row, col)
+            if crop is None:
+                continue
+            reveal_score, sharpness = _reveal_score(crop)
+            samples_by_cell[cell_id].append(
+                CellFrameSample(
+                    frame_index=original_index,
+                    crop=crop,
+                    reveal_score=reveal_score,
+                    sharpness=sharpness,
+                )
+            )
+    if calibration_image is None:
         raise ValueError("No images provided for reconstruction.")
 
-    calibration_image = images[0]
-    boards = [warp_image_to_board(frame, calibration) for frame in images]
     observations: dict[str, CellObservation] = {}
     features: dict[str, TileFeature] = {}
     deferred_unresolved: set[str] = set()
@@ -1137,20 +1196,7 @@ def reconstruct_from_images(
     for row in range(calibration.rows):
         for col in range(calibration.cols):
             cell_id = f"r{row:02d}c{col:02d}"
-            samples: list[CellFrameSample] = []
-            for frame_index, board in enumerate(boards):
-                crop = _cell_crop(board, calibration, row, col)
-                if crop is None:
-                    continue
-                reveal_score, sharpness = _reveal_score(crop)
-                samples.append(
-                    CellFrameSample(
-                        frame_index=frame_index,
-                        crop=crop,
-                        reveal_score=reveal_score,
-                        sharpness=sharpness,
-                    )
-                )
+            samples = samples_by_cell.get(cell_id, [])
             if not samples:
                 continue
 
@@ -1165,7 +1211,7 @@ def reconstruct_from_images(
                 sample for sample in samples if sample.state in {"transition-opening", "transition-closing"}
             ]
 
-            timeline = [_timeline_record(sample) for sample in samples if sample.state != "hidden"]
+            timeline = [_timeline_record(sample) for sample in samples if sample.state != "hidden"] if options.record_timelines else []
 
             if stable_candidates:
                 stable_candidates.sort(
@@ -1173,18 +1219,20 @@ def reconstruct_from_images(
                     reverse=True,
                 )
                 primary = stable_candidates[0]
-                primary_path = _write_crop(crops_dir / f"{cell_id}.png", primary.crop)
+                primary_path = _write_crop(crops_dir / f"{cell_id}.png", primary.crop) if options.write_primary_crops else None
                 alternates: list[dict] = []
-                for alt_index, sample in enumerate(stable_candidates[1:3], start=1):
-                    alt_path = _write_crop(crops_dir / f"{cell_id}__alt{alt_index}_f{sample.frame_index:04d}.png", sample.crop)
-                    alternates.append(_candidate_record(sample, alt_path))
+                if options.write_alternate_crops:
+                    for alt_index, sample in enumerate(stable_candidates[1:3], start=1):
+                        alt_path = _write_crop(crops_dir / f"{cell_id}__alt{alt_index}_f{sample.frame_index:04d}.png", sample.crop)
+                        alternates.append(_candidate_record(sample, alt_path))
                 discarded: list[dict] = []
-                for drop_index, sample in enumerate(
-                    sorted(transition_candidates, key=lambda item: (item.reveal_score, item.visible_width_ratio), reverse=True)[:2],
-                    start=1,
-                ):
-                    drop_path = _write_crop(crops_dir / f"{cell_id}__drop{drop_index}_f{sample.frame_index:04d}.png", sample.crop)
-                    discarded.append(_candidate_record(sample, drop_path))
+                if options.write_alternate_crops:
+                    for drop_index, sample in enumerate(
+                        sorted(transition_candidates, key=lambda item: (item.reveal_score, item.visible_width_ratio), reverse=True)[:2],
+                        start=1,
+                    ):
+                        drop_path = _write_crop(crops_dir / f"{cell_id}__drop{drop_index}_f{sample.frame_index:04d}.png", sample.crop)
+                        discarded.append(_candidate_record(sample, drop_path))
 
                 observations[cell_id] = CellObservation(
                     row=row,
@@ -1208,12 +1256,13 @@ def reconstruct_from_images(
                 )
             elif transition_candidates:
                 discarded = []
-                for drop_index, sample in enumerate(
-                    sorted(transition_candidates, key=lambda item: (item.reveal_score, item.visible_width_ratio), reverse=True)[:3],
-                    start=1,
-                ):
-                    drop_path = _write_crop(crops_dir / f"{cell_id}__drop{drop_index}_f{sample.frame_index:04d}.png", sample.crop)
-                    discarded.append(_candidate_record(sample, drop_path))
+                if options.write_alternate_crops:
+                    for drop_index, sample in enumerate(
+                        sorted(transition_candidates, key=lambda item: (item.reveal_score, item.visible_width_ratio), reverse=True)[:3],
+                        start=1,
+                    ):
+                        drop_path = _write_crop(crops_dir / f"{cell_id}__drop{drop_index}_f{sample.frame_index:04d}.png", sample.crop)
+                        discarded.append(_candidate_record(sample, drop_path))
                 observations[cell_id] = CellObservation(
                     row=row,
                     col=col,
@@ -1241,13 +1290,16 @@ def reconstruct_from_images(
         session_dir=str(session_dir),
     )
     result = enforce_required_group_size(result, required_group_size)
-    fit_debug_path = render_grid_fit_debug(calibration_image, calibration, session_dir / "grid_fit_debug.png")
-    result.grid_fit_debug_path = str(fit_debug_path)
-    composed_path, debug_path = render_debug_grids(result, session_dir)
-    result.grid_composed_path = str(composed_path)
-    result.grid_debug_path = str(debug_path)
-    candidate_debug_path = render_candidate_debug(result, session_dir)
-    result.candidate_debug_path = str(candidate_debug_path) if candidate_debug_path else None
+    if options.generate_grid_fit_debug:
+        fit_debug_path = render_grid_fit_debug(calibration_image, calibration, session_dir / "grid_fit_debug.png")
+        result.grid_fit_debug_path = str(fit_debug_path)
+    if options.generate_grid_artifacts:
+        composed_path, debug_path = render_debug_grids(result, session_dir)
+        result.grid_composed_path = str(composed_path)
+        result.grid_debug_path = str(debug_path)
+    if options.generate_candidate_debug:
+        candidate_debug_path = render_candidate_debug(result, session_dir)
+        result.candidate_debug_path = str(candidate_debug_path) if candidate_debug_path else None
     return result
 
 
@@ -1465,6 +1517,7 @@ def reconstruct_from_session(
     config: MatchTileConfig,
     calibration: Calibration,
     required_group_size: int | None = None,
+    options: ReconstructionOptions | None = None,
 ) -> ReconstructionResult:
     frames_dir = session_dir / "frames"
     image_paths = sorted(frames_dir.glob("*.png"))
@@ -1474,6 +1527,7 @@ def reconstruct_from_session(
         config=config,
         calibration=calibration,
         required_group_size=required_group_size,
+        options=options,
     )
     result.save(session_dir / "result.json")
     return result
