@@ -7,23 +7,24 @@ from typing import Sequence
 
 from matchtile.autoplay import auto_click_groups
 from matchtile.calibration_store import calibration_profile_path, load_calibration, save_calibration
-from matchtile.capture import capture_frame, wait_for_hotkey
-from matchtile.config import DEFAULT_CONFIG_PATH, MatchTileConfig
+from matchtile.capture import capture_frame, capture_frames, wait_for_hotkey
+from matchtile.config import DEFAULT_CONFIG_PATH, ConfigLoadResult, MatchTileConfig
 from matchtile.models import Calibration, ReconstructionResult
 from matchtile.overlay import launch_overlay
 from matchtile.phantom_board import (
     PHANTOM_BOARD_URL,
     board_source_metadata,
     build_reconstruction_from_phantom_board,
-    fetch_phantom_board,
     load_phantom_board,
+    load_phantom_metadata,
+    metadata_source,
     save_phantom_board,
-    wait_for_fresh_phantom_board,
 )
 from matchtile.runtime_control import AbortRequested, StopToken
 from matchtile.session import create_session_dir
 from matchtile.vision import (
     build_manual_calibration,
+    edit_calibration,
     load_image,
     manual_select_corners,
     reconstruct_from_images,
@@ -41,6 +42,9 @@ def _parser() -> argparse.ArgumentParser:
     calibrate.add_argument("--image", type=Path)
     calibrate.add_argument("--window", type=str, default=None)
     calibrate.add_argument("--out", type=Path)
+    calibrate.add_argument("--rows", type=int, default=None)
+    calibrate.add_argument("--cols", type=int, default=None)
+    calibrate.add_argument("--group-size", type=int, default=None)
 
     replay = subparsers.add_parser("replay", help="Reconstruct from a session directory, website board JSON, or image list.")
     replay.add_argument("--session", type=Path)
@@ -49,7 +53,10 @@ def _parser() -> argparse.ArgumentParser:
     replay.add_argument("--calibration", type=Path)
     replay.add_argument("--max-group-size", type=int, default=None)
 
-    arm = subparsers.add_parser("arm", help="Wait for a hotkey, fetch the live phantom board, and solve.")
+    arm = subparsers.add_parser(
+        "arm",
+        help="Wait for a hotkey, capture the reveal, and solve using the saved local calibration.",
+    )
     arm.add_argument("--window", type=str, default=None)
     arm.add_argument("--overlay", action="store_true")
     arm.add_argument("--start-now", action="store_true")
@@ -70,6 +77,20 @@ def _parser() -> argparse.ArgumentParser:
 
 def _image_calibration_path(image_path: Path) -> Path:
     return image_path.with_suffix(".calibration.json")
+
+
+def _config_runtime_summary(config: MatchTileConfig, config_load: ConfigLoadResult) -> list[str]:
+    if config_load.created_default_file:
+        source = f"Config source: defaults from code (saved to {config_load.path})"
+    else:
+        source = f"Config source: {config_load.path}"
+    effective = (
+        "Effective runtime config: "
+        f"capture_fps={config.capture_fps}, "
+        f"reveal_duration_s={config.reveal_duration_s:.2f}, "
+        f"max_group_size={config.max_group_size}"
+    )
+    return [source, effective]
 
 
 def _format_group_click_order(group) -> str:
@@ -145,6 +166,13 @@ def _resolve_replay_board(args: argparse.Namespace) -> tuple[str, object | None,
     return "legacy", None, None
 
 
+def _session_board_metadata(session_dir: Path) -> tuple[dict | None, Path | None]:
+    metadata_path = session_dir / "board_metadata.json"
+    if metadata_path.exists():
+        return load_phantom_metadata(metadata_path), metadata_path
+    return None, None
+
+
 def _offset_for_overlay(calibration: Calibration, title_regex: str) -> tuple[int, int]:
     try:
         target = find_window(title_regex)
@@ -160,10 +188,13 @@ def cmd_calibrate(args: argparse.Namespace, config: MatchTileConfig) -> int:
     if bool(args.image) == bool(args.window):
         raise RuntimeError("Calibration requires exactly one of --image or --window.")
 
+    existing_calibration: Calibration | None = None
     if args.image:
         image = load_image(args.image)
         out_path = args.out or _image_calibration_path(args.image)
         window_title = None
+        if out_path.exists():
+            existing_calibration = load_calibration(out_path)
     else:
         title_regex = args.window or config.window_title_regex
         target = find_window(title_regex)
@@ -171,16 +202,33 @@ def cmd_calibrate(args: argparse.Namespace, config: MatchTileConfig) -> int:
         image = capture_frame(target.client_rect)
         out_path = args.out or calibration_profile_path(config, target.title, target.client_rect.width, target.client_rect.height)
         window_title = target.title
+        if out_path.exists():
+            existing_calibration = load_calibration(out_path)
 
-    print("Click top-left, top-right, bottom-right, then bottom-left.")
-    corners = manual_select_corners(image)
-    calibration = build_manual_calibration((image.shape[1], image.shape[0]), rows=1, cols=1, corners=corners)
+    rows = args.rows or (existing_calibration.rows if existing_calibration else None)
+    cols = args.cols or (existing_calibration.cols if existing_calibration else None)
+    group_size = args.group_size or (existing_calibration.group_size if existing_calibration else config.max_group_size)
+    if rows is None or cols is None:
+        raise RuntimeError("Fresh calibration requires --rows and --cols unless a saved profile already exists for this window size.")
+
+    if existing_calibration:
+        print(f"Loaded existing calibration from {out_path}")
+    else:
+        print("No existing calibration found. Starting fresh corner capture.")
+    calibration = edit_calibration(
+        image,
+        initial_rows=rows,
+        initial_cols=cols,
+        initial_group_size=group_size,
+        existing_calibration=existing_calibration,
+    )
     save_calibration(out_path, calibration)
     print(f"Saved calibration to {out_path}")
     if window_title:
         print(f"Window: {window_title}")
         print(f"Client size: {calibration.client_width}x{calibration.client_height}")
     print(f"Board bounds: {calibration.board_rect}")
+    print(f"Rows: {calibration.rows} | Cols: {calibration.cols} | Max group size: {calibration.group_size}")
     return 0
 
 
@@ -207,7 +255,33 @@ def cmd_replay(args: argparse.Namespace, config: MatchTileConfig) -> int:
         result.save(session_dir / "result.json")
         print(f"Reconstructed phantom board into {session_dir / 'result.json'}")
     elif args.session:
-        result = reconstruct_from_session(args.session, config, calibration=calibration)
+        metadata, metadata_path = _session_board_metadata(args.session)
+        required_group_size = None
+        max_group_size = calibration.group_size if calibration.group_size >= 2 else config.max_group_size
+        if metadata is not None and calibration.source == "website-metadata":
+            required_group_size = metadata["pair_size"]
+            max_group_size = required_group_size
+        if required_group_size is not None:
+            if args.max_group_size is not None and args.max_group_size != required_group_size:
+                raise RuntimeError(
+                    f"--max-group-size {args.max_group_size} did not match session pair size {required_group_size}."
+                )
+        elif args.max_group_size is not None:
+            max_group_size = max(2, min(args.max_group_size, 4))
+        config.max_group_size = max_group_size
+        result = reconstruct_from_session(
+            args.session,
+            config,
+            calibration=calibration,
+            required_group_size=required_group_size,
+        )
+        if metadata is not None:
+            result.board_source = metadata_source(
+                metadata,
+                PHANTOM_BOARD_URL,
+                mode="session-metadata",
+                fetched_at=datetime.now(timezone.utc),
+            )
         solve_order_path = _write_solve_order(result, args.session)
         result.solve_order_path = str(solve_order_path)
         result.save(args.session / "result.json")
@@ -236,11 +310,12 @@ def cmd_replay(args: argparse.Namespace, config: MatchTileConfig) -> int:
     return 0
 
 
-def cmd_arm(args: argparse.Namespace, config: MatchTileConfig) -> int:
+def cmd_arm(args: argparse.Namespace, config: MatchTileConfig, config_load: ConfigLoadResult) -> int:
     if args.max_group_size is not None:
         config.max_group_size = max(2, min(args.max_group_size, 4))
     title_regex = args.window or config.window_title_regex
     base_calibration, calibration_path, screen_offset, target = _load_live_calibration(config, title_regex)
+    reveal_duration = config.reveal_duration_s
     click_delay_s = config.click_delay_s
     move_settle_s = config.move_settle_s
     mouse_down_hold_s = config.mouse_down_hold_s
@@ -248,6 +323,8 @@ def cmd_arm(args: argparse.Namespace, config: MatchTileConfig) -> int:
     bring_window_to_front(target.hwnd)
     session_dir = create_session_dir(config)
     print(f"Target window: {target.title}")
+    for line in _config_runtime_summary(config, config_load):
+        print(line)
     print(f"Calibration: {calibration_path}")
     print(
         "Capture region: "
@@ -255,52 +332,81 @@ def cmd_arm(args: argparse.Namespace, config: MatchTileConfig) -> int:
         f"({target.client_rect.x}, {target.client_rect.y})"
     )
     print(f"Session directory: {session_dir}")
+    print(
+        "Capture settings: "
+        f"{config.capture_fps} FPS for {reveal_duration:.2f}s "
+        f"(about {int(config.capture_fps * reveal_duration)} frames expected)"
+    )
+    print(
+        "Loaded calibration: "
+        f"{base_calibration.cols} cols x {base_calibration.rows} rows | max group size {base_calibration.group_size}"
+    )
 
     with StopToken() as stop_token:
-        print(f"Fetching baseline phantom board from {PHANTOM_BOARD_URL}...")
-        baseline_board = fetch_phantom_board()
-        print(
-            "Baseline board: "
-            f"{baseline_board.width}x{baseline_board.height}, "
-            f"pairSize {baseline_board.pairSize}, "
-            f"startedAt {baseline_board.startedAt or 'unknown'}"
-        )
+        max_group_size = base_calibration.group_size
+        if args.max_group_size is not None:
+            if args.max_group_size > max_group_size:
+                raise RuntimeError(
+                    f"--max-group-size {args.max_group_size} exceeded calibration group size {max_group_size}."
+                )
+            max_group_size = max(2, min(args.max_group_size, 4))
+        config.max_group_size = max_group_size
+        save_calibration(session_dir / "calibration.json", base_calibration)
+
         if not args.start_now:
             wait_for_hotkey(stop_token=stop_token)
-            print("Activating target window for solve.")
+            print("Activating target window for capture.")
             bring_window_to_front(target.hwnd)
         else:
-            print("Start-now enabled. Polling for a fresh phantom board immediately.")
+            print("Start-now enabled. Beginning reveal capture immediately.")
             bring_window_to_front(target.hwnd)
 
-        print("Polling for a fresh phantom board...")
-        board = wait_for_fresh_phantom_board(
-            baseline_board,
-            url=PHANTOM_BOARD_URL,
-            poll_interval_s=0.25,
-            timeout_s=10.0,
+        print("Capturing reveal frames...")
+        metadata = capture_frames(
+            target.client_rect,
+            fps=config.capture_fps,
+            duration_s=reveal_duration,
+            out_dir=session_dir,
             stop_token=stop_token,
         )
-        print(
-            "Fresh board detected: "
-            f"{board.width}x{board.height}, "
-            f"pairSize {board.pairSize}, "
-            f"startedAt {board.startedAt or 'unknown'}"
+        print(f"Capture complete. Saved {metadata.frame_count} frame(s).")
+        (session_dir / "capture.json").write_text(
+            __import__("json").dumps(
+                {
+                    "fps": metadata.fps,
+                    "duration_s": metadata.duration_s,
+                    "frame_count": metadata.frame_count,
+                    "capture_rect": metadata.capture_rect.as_dict(),
+                    "window_title": target.title,
+                    "calibration_path": calibration_path,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
         )
-        if args.max_group_size is not None and args.max_group_size != board.pairSize:
-            raise RuntimeError(
-                f"--max-group-size {args.max_group_size} did not match phantom board pairSize {board.pairSize}."
-            )
-        board_source = board_source_metadata(board, PHANTOM_BOARD_URL, mode="live-api", fetched_at=datetime.now(timezone.utc))
-        save_phantom_board(session_dir / "phantom_board.json", board)
-
-        print("Building exact groups from phantom board data...")
-        result = build_reconstruction_from_phantom_board(board, base_calibration, session_dir=session_dir, board_source=board_source)
-        save_calibration(session_dir / "calibration.json", result.calibration)
+        print(f"Reconstructing board from local reveal frames with group sizes 2-{max_group_size}...")
+        result = reconstruct_from_session(
+            session_dir,
+            config,
+            calibration=base_calibration,
+            required_group_size=None,
+        )
+        result.board_source = {
+            "mode": "live-capture",
+            "rows": base_calibration.rows,
+            "cols": base_calibration.cols,
+            "group_size": base_calibration.group_size,
+            "max_group_size": max_group_size,
+            "calibration_path": calibration_path,
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+        }
         solve_order_path = _write_solve_order(result, session_dir)
         result.solve_order_path = str(solve_order_path)
         result.save(session_dir / "result.json")
-        print(f"Saved phantom board session into {session_dir}")
+        print(
+            f"Captured {metadata.frame_count} frame(s) into {session_dir} "
+            f"and reconstructed {len(result.groups)} group(s) up to size {max_group_size}."
+        )
         print(f"Groups: {len(result.groups)} | Unresolved: {len(result.unresolved)}")
         _print_group_summary(result)
         if result.grid_fit_debug_path:
@@ -354,10 +460,12 @@ def cmd_arm(args: argparse.Namespace, config: MatchTileConfig) -> int:
 
 
 def cmd_overlay(args: argparse.Namespace, config: MatchTileConfig) -> int:
-    if args.max_group_size is not None:
-        config.max_group_size = max(2, min(args.max_group_size, 4))
     result_path = args.session / "result.json"
     result = ReconstructionResult.load(result_path)
+    if args.max_group_size is not None:
+        config.max_group_size = max(2, min(args.max_group_size, 4))
+    else:
+        config.max_group_size = result.calibration.group_size
     title_regex = args.window or config.window_title_regex
     screen_offset = _offset_for_overlay(result.calibration, title_regex)
     click_delay_s = config.click_delay_s
@@ -393,14 +501,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     try:
         args = parser.parse_args(argv)
-        config = MatchTileConfig.load(args.config)
+        config_load = MatchTileConfig.load_with_result(args.config)
+        config = config_load.config
 
         if args.command == "calibrate":
             return cmd_calibrate(args, config)
         if args.command == "replay":
             return cmd_replay(args, config)
         if args.command == "arm":
-            return cmd_arm(args, config)
+            return cmd_arm(args, config, config_load)
         if args.command == "overlay":
             return cmd_overlay(args, config)
         parser.error(f"Unknown command: {args.command}")

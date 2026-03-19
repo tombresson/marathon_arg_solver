@@ -8,7 +8,9 @@ from pathlib import Path
 from matchtile.models import PhantomBoard, Point
 from matchtile.phantom_board import (
     build_reconstruction_from_phantom_board,
+    derive_board_calibration,
     load_phantom_board,
+    parse_phantom_metadata,
     parse_phantom_board,
     phantom_board_hash,
     save_phantom_board,
@@ -62,6 +64,14 @@ class PhantomBoardTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             parse_phantom_board(payload)
 
+    def test_parse_phantom_metadata_uses_dimensions_only(self) -> None:
+        payload = _sample_payload()
+        payload["grid"] = [{"row": 99, "col": 99, "imgIdx": 1, "url": "https://invalid.local/bad.png"}]
+        metadata = parse_phantom_metadata(payload)
+        self.assertEqual(metadata["width"], 4)
+        self.assertEqual(metadata["height"], 2)
+        self.assertEqual(metadata["pair_size"], 2)
+
     def test_board_hash_is_stable(self) -> None:
         board = PhantomBoard.from_dict(_sample_payload())
         self.assertEqual(phantom_board_hash(board), phantom_board_hash(board))
@@ -73,6 +83,20 @@ class PhantomBoardTests(unittest.TestCase):
             save_phantom_board(path, board)
             restored = load_phantom_board(path)
             self.assertEqual(restored.to_dict(), board.to_dict())
+
+    def test_derive_board_calibration_respects_runtime_dimensions(self) -> None:
+        base_calibration = build_manual_calibration(
+            image_size=(900, 700),
+            rows=1,
+            cols=1,
+            corners=_corners(),
+        )
+        derived = derive_board_calibration(base_calibration, rows=2, cols=4)
+        self.assertEqual(derived.rows, 2)
+        self.assertEqual(derived.cols, 4)
+        self.assertEqual(len(derived.centers), 8)
+        self.assertEqual(derived.client_width, base_calibration.client_width)
+        self.assertEqual(derived.client_height, base_calibration.client_height)
 
     def test_build_reconstruction_from_phantom_board_creates_exact_groups(self) -> None:
         base_calibration = build_manual_calibration(

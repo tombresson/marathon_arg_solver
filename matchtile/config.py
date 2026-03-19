@@ -9,11 +9,18 @@ DEFAULT_CONFIG_PATH = Path("matchtile.json")
 
 
 @dataclass(slots=True)
+class ConfigLoadResult:
+    config: "MatchTileConfig"
+    path: Path
+    created_default_file: bool = False
+
+
+@dataclass(slots=True)
 class MatchTileConfig:
     window_title_regex: str = r"Discord|NULL//TRANSMIT\.ERR"
     capture_fps: int = 18
-    reveal_duration_s: float = 10.0
-    click_delay_s: float = 0.5
+    reveal_duration_s: float = 32.0
+    click_delay_s: float = 0.75
     move_settle_s: float = 0.035
     mouse_down_hold_s: float = 0.045
     timing_jitter_s: float = 0.010
@@ -41,13 +48,17 @@ class MatchTileConfig:
 
     @classmethod
     def load(cls, path: Path | None = None) -> "MatchTileConfig":
+        return cls.load_with_result(path).config
+
+    @classmethod
+    def load_with_result(cls, path: Path | None = None) -> ConfigLoadResult:
         config_path = path or DEFAULT_CONFIG_PATH
         if not config_path.exists():
             cfg = cls()
             cfg.save(config_path)
-            return cfg
+            return ConfigLoadResult(config=cfg, path=config_path, created_default_file=True)
         data = json.loads(config_path.read_text(encoding="utf-8"))
-        return cls(**data)
+        return ConfigLoadResult(config=cls(**data), path=config_path, created_default_file=False)
 
     def save(self, path: Path | None = None) -> None:
         config_path = path or DEFAULT_CONFIG_PATH

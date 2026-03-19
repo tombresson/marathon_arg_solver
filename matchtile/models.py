@@ -47,7 +47,13 @@ class Calibration:
     pitch_y: float
     offset_x: float
     offset_y: float
+    group_size: int = 2
     board_corners: list[Point] = field(default_factory=list)
+    anchor_rows: int = 0
+    anchor_cols: int = 0
+    anchor_pitch_x: float = 0.0
+    anchor_pitch_y: float = 0.0
+    anchor_corners: list[Point] = field(default_factory=list)
     client_width: int = 0
     client_height: int = 0
     rectified_width: int = 0
@@ -74,12 +80,28 @@ class Calibration:
                 Point(float(rect.right), float(rect.bottom)),
                 Point(float(rect.x), float(rect.bottom)),
             ]
-        rest = {k: v for k, v in data.items() if k not in {"board_rect", "centers", "board_corners"}}
+        raw_anchor_corners = data.get("anchor_corners")
+        if raw_anchor_corners:
+            anchor_corners = [Point(**entry) for entry in raw_anchor_corners]
+        else:
+            anchor_corners = [Point(point.x, point.y) for point in board_corners]
+        rest = {k: v for k, v in data.items() if k not in {"board_rect", "centers", "board_corners", "anchor_corners"}}
+        rest.setdefault("group_size", 2)
+        rest.setdefault("anchor_rows", rest.get("rows", 0))
+        rest.setdefault("anchor_cols", rest.get("cols", 0))
+        rest.setdefault("anchor_pitch_x", rest.get("pitch_x", 0.0))
+        rest.setdefault("anchor_pitch_y", rest.get("pitch_y", 0.0))
         rest.setdefault("client_width", data["board_rect"]["width"])
         rest.setdefault("client_height", data["board_rect"]["height"])
         rest.setdefault("rectified_width", max(int(round(rest.get("pitch_x", 0.0) * rest.get("cols", 0))), 0))
         rest.setdefault("rectified_height", max(int(round(rest.get("pitch_y", 0.0) * rest.get("rows", 0))), 0))
-        return cls(board_rect=Rect(**data["board_rect"]), board_corners=board_corners, centers=centers, **rest)
+        return cls(
+            board_rect=Rect(**data["board_rect"]),
+            board_corners=board_corners,
+            anchor_corners=anchor_corners,
+            centers=centers,
+            **rest,
+        )
 
 
 @dataclass(slots=True)

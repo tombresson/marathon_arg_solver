@@ -9,17 +9,21 @@ import numpy as np
 
 from matchtile.calibration_store import calibration_profile_path, load_calibration, save_calibration
 from matchtile.config import MatchTileConfig
-from matchtile.models import Point
+from matchtile.models import Calibration, CellObservation, MatchGroup, Point, ReconstructionResult, Rect
 from matchtile.vision import (
     CellFrameSample,
     TileFeature,
     _build_hidden_reference,
     _build_feature,
     _classify_sample_state,
+    _draw_corner_magnifier,
+    _extract_magnifier_crop,
+    derive_center_anchored_calibration,
     _reveal_score,
     _refine_transition_states,
     build_manual_calibration,
     compare_features,
+    enforce_required_group_size,
     infer_match_groups,
     load_image,
     reconstruct_from_images,
@@ -92,6 +96,23 @@ class VisionTests(unittest.TestCase):
         self.assertLess(top_left.x, bottom_right.x)
         self.assertLess(top_left.y, bottom_right.y)
 
+    def test_extract_magnifier_crop_clamps_at_image_edges(self) -> None:
+        image = np.zeros((20, 30, 3), dtype=np.uint8)
+        crop, focal = _extract_magnifier_crop(image, center_x=0, center_y=0, crop_size=11)
+        self.assertEqual(crop.shape[:2], (11, 11))
+        self.assertEqual(focal, (0, 0))
+        crop2, focal2 = _extract_magnifier_crop(image, center_x=29, center_y=19, crop_size=11)
+        self.assertEqual(crop2.shape[:2], (11, 11))
+        self.assertEqual(focal2, (10, 10))
+
+    def test_draw_corner_magnifier_renders_inset_on_canvas(self) -> None:
+        image = np.full((120, 160, 3), 35, dtype=np.uint8)
+        image[50:70, 70:90] = (220, 180, 60)
+        canvas = image.copy()
+        result = _draw_corner_magnifier(canvas, image, 80, 60, "Pick TL", crop_size=21, inset_size=120)
+        self.assertEqual(result.shape, canvas.shape)
+        self.assertGreater(float(np.mean(np.abs(result.astype(np.float32) - image.astype(np.float32)))), 1.0)
+
     def test_build_manual_calibration_changes_lattice_when_counts_change(self) -> None:
         smaller = build_manual_calibration(
             image_size=(2556, 1360),
@@ -109,6 +130,47 @@ class VisionTests(unittest.TestCase):
         self.assertNotEqual(smaller.rows, larger.rows)
         self.assertLess(larger.pitch_x, smaller.pitch_x)
         self.assertLess(larger.pitch_y, smaller.pitch_y)
+
+    def test_build_manual_calibration_re_subdivides_within_same_corners(self) -> None:
+        base = build_manual_calibration(
+            image_size=(2556, 1360),
+            rows=25,
+            cols=40,
+            corners=_empty_board_corners(),
+            group_size=4,
+        )
+        denser = build_manual_calibration(
+            image_size=(2556, 1360),
+            rows=25,
+            cols=64,
+            corners=base.board_corners,
+            group_size=4,
+        )
+        self.assertEqual(denser.board_rect.x, base.board_rect.x)
+        self.assertEqual(denser.board_rect.y, base.board_rect.y)
+        self.assertEqual(denser.board_rect.width, base.board_rect.width)
+        self.assertEqual(denser.board_rect.height, base.board_rect.height)
+        self.assertLess(denser.pitch_x, base.pitch_x)
+        self.assertLessEqual(denser.pitch_y, base.pitch_y)
+
+    def test_center_anchored_derivation_preserves_pitch_and_shrinks_inward(self) -> None:
+        base = build_manual_calibration(
+            image_size=(2556, 1360),
+            rows=25,
+            cols=64,
+            corners=_empty_board_corners(),
+            group_size=4,
+        )
+        derived = derive_center_anchored_calibration(base, rows=25, cols=40, group_size=4)
+        self.assertEqual(derived.rows, 25)
+        self.assertEqual(derived.cols, 40)
+        self.assertEqual(derived.group_size, 4)
+        self.assertAlmostEqual(derived.pitch_x, base.anchor_pitch_x, places=2)
+        self.assertAlmostEqual(derived.pitch_y, base.anchor_pitch_y, places=2)
+        self.assertGreater(derived.board_rect.x, base.board_rect.x)
+        self.assertLess(derived.board_rect.right, base.board_rect.right)
+        self.assertGreaterEqual(derived.board_rect.y, base.board_rect.y)
+        self.assertLessEqual(derived.board_rect.bottom, base.board_rect.bottom)
 
     def test_build_manual_calibration_clamps_minimum_pitch_geometry(self) -> None:
         calibration = build_manual_calibration(
@@ -146,6 +208,7 @@ class VisionTests(unittest.TestCase):
             rows=25,
             cols=64,
             corners=_empty_board_corners(),
+            group_size=4,
         )
         with tempfile.TemporaryDirectory() as tmp:
             config.calibration_dir = tmp
@@ -154,7 +217,9 @@ class VisionTests(unittest.TestCase):
             restored = load_calibration(path)
             self.assertEqual(restored.rows, 25)
             self.assertEqual(restored.cols, 64)
+            self.assertEqual(restored.group_size, 4)
             self.assertEqual(len(restored.board_corners), 4)
+            self.assertEqual(len(restored.anchor_corners), 4)
             self.assertEqual(restored.client_width, 2556)
             self.assertEqual(restored.client_height, 1360)
 
@@ -331,6 +396,70 @@ class VisionTests(unittest.TestCase):
         groups, unresolved = infer_match_groups(features, config)
         self.assertEqual(groups, [])
         self.assertEqual(sorted(unresolved), sorted(features))
+
+    def test_enforce_required_group_size_moves_partial_groups_to_unresolved(self) -> None:
+        calibration = Calibration(
+            board_rect=Rect(0, 0, 100, 100),
+            rows=1,
+            cols=6,
+            pitch_x=16.0,
+            pitch_y=100.0,
+            offset_x=0.0,
+            offset_y=0.0,
+            board_corners=[Point(0.0, 0.0), Point(100.0, 0.0), Point(100.0, 100.0), Point(0.0, 100.0)],
+            client_width=100,
+            client_height=100,
+            rectified_width=100,
+            rectified_height=100,
+            centers=[],
+        )
+        observations = {
+            "r00c00": CellObservation(0, 0, 0, 1.0, 1.0),
+            "r00c01": CellObservation(0, 1, 0, 1.0, 1.0),
+            "r00c02": CellObservation(0, 2, 0, 1.0, 1.0),
+            "r00c03": CellObservation(0, 3, 0, 1.0, 1.0),
+            "r00c04": CellObservation(0, 4, 0, 1.0, 1.0),
+            "r00c05": CellObservation(0, 5, 0, 1.0, 1.0),
+        }
+        result = ReconstructionResult(
+            calibration=calibration,
+            observations=observations,
+            groups=[
+                MatchGroup(label="G001", members=["r00c00", "r00c01"], confidence=0.9, group_size=2),
+                MatchGroup(
+                    label="G002",
+                    members=["r00c02", "r00c03", "r00c04", "r00c05"],
+                    confidence=0.95,
+                    group_size=4,
+                ),
+            ],
+            unresolved=[],
+            session_dir=".",
+        )
+        filtered = enforce_required_group_size(result, 4)
+        self.assertEqual([group.label for group in filtered.groups], ["G002"])
+        self.assertEqual(sorted(filtered.unresolved), ["r00c00", "r00c01"])
+
+    def test_infer_match_groups_with_max_group_size_three_keeps_twos_and_threes(self) -> None:
+        config = MatchTileConfig(tile_match_threshold=0.70, group_confidence_threshold=0.78, max_group_size=3)
+
+        def feature(name: str, values: list[float]) -> TileFeature:
+            vector = np.array(values, dtype=np.float32)
+            vector = vector / np.linalg.norm(vector)
+            return TileFeature(cell_id=name, descriptor=vector)
+
+        features = {
+            "a1": feature("a1", [1.0, 0.0, 0.0, 0.0]),
+            "a2": feature("a2", [0.99, 0.01, 0.0, 0.0]),
+            "b1": feature("b1", [0.0, 1.0, 0.0, 0.0]),
+            "b2": feature("b2", [0.02, 0.98, 0.0, 0.0]),
+            "b3": feature("b3", [0.01, 0.99, 0.0, 0.0]),
+        }
+
+        groups, unresolved = infer_match_groups(features, config)
+        group_sizes = sorted(group.group_size for group in groups)
+        self.assertEqual(group_sizes, [2, 3])
+        self.assertFalse(unresolved)
 
 
 if __name__ == "__main__":

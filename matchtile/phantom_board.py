@@ -36,6 +36,44 @@ def _request_json(url: str, timeout_s: float = 10.0) -> dict:
     return json.loads(body)
 
 
+def parse_phantom_metadata(payload: dict) -> dict:
+    try:
+        width = int(payload["width"])
+        height = int(payload["height"])
+        pair_size = int(payload["pairSize"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"Malformed phantom board metadata: {exc}") from exc
+    if width <= 0 or height <= 0:
+        raise RuntimeError("Phantom board metadata dimensions must be positive.")
+    if not 2 <= pair_size <= 4:
+        raise RuntimeError(f"Unsupported phantom board pair size: {pair_size}.")
+    return {
+        "width": width,
+        "height": height,
+        "pair_size": pair_size,
+        "started_at": payload.get("startedAt"),
+        "timestamp": payload.get("timestamp"),
+        "reported_at": payload.get("reportedAt"),
+        "remaining_time": payload.get("remainingTime"),
+    }
+
+
+def fetch_phantom_metadata(url: str = PHANTOM_BOARD_URL, timeout_s: float = 10.0) -> dict:
+    try:
+        payload = _request_json(url, timeout_s=timeout_s)
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Failed to fetch phantom metadata from {url}: {exc}") from exc
+    return parse_phantom_metadata(payload)
+
+
+def save_phantom_metadata(path: Path, metadata: dict) -> None:
+    path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
+def load_phantom_metadata(path: Path) -> dict:
+    return parse_phantom_metadata(json.loads(path.read_text(encoding="utf-8")))
+
+
 def parse_phantom_board(payload: dict) -> PhantomBoard:
     try:
         board = PhantomBoard.from_dict(payload)
@@ -152,7 +190,8 @@ def derive_board_calibration(base_calibration: Calibration, rows: int, cols: int
         rows=rows,
         cols=cols,
         corners=base_calibration.board_corners,
-        source="phantom-board",
+        group_size=base_calibration.group_size,
+        source="website-metadata",
     )
     polygon = np.array([[point.x, point.y] for point in calibration.board_corners], dtype=np.float32)
     for center in calibration.centers:
@@ -322,4 +361,20 @@ def board_source_metadata(board: PhantomBoard, source_url: str, mode: str, fetch
         "width": board.width,
         "height": board.height,
         "pair_size": board.pairSize,
+    }
+
+
+def metadata_source(metadata: dict, source_url: str, mode: str, fetched_at: datetime | None = None) -> dict:
+    fetched = fetched_at or datetime.now(timezone.utc)
+    return {
+        "mode": mode,
+        "url": source_url,
+        "fetched_at": fetched.isoformat(),
+        "started_at": metadata.get("started_at"),
+        "timestamp": metadata.get("timestamp"),
+        "reported_at": metadata.get("reported_at"),
+        "remaining_time": metadata.get("remaining_time"),
+        "width": metadata["width"],
+        "height": metadata["height"],
+        "pair_size": metadata["pair_size"],
     }

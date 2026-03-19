@@ -53,6 +53,84 @@ def _board_rect_from_corners(corners: list[Point]) -> Rect:
     return Rect(left, top, max(right - left, 1), max(bottom - top, 1))
 
 
+def _extract_magnifier_crop(image: np.ndarray, center_x: int, center_y: int, crop_size: int = 31) -> tuple[np.ndarray, tuple[int, int]]:
+    crop_size = max(5, int(crop_size))
+    if crop_size % 2 == 0:
+        crop_size += 1
+    half = crop_size // 2
+    height, width = image.shape[:2]
+    center_x = int(np.clip(center_x, 0, max(width - 1, 0)))
+    center_y = int(np.clip(center_y, 0, max(height - 1, 0)))
+    x0 = center_x - half
+    y0 = center_y - half
+    x1 = center_x + half + 1
+    y1 = center_y + half + 1
+    if x0 < 0:
+        x1 = min(width, x1 - x0)
+        x0 = 0
+    if y0 < 0:
+        y1 = min(height, y1 - y0)
+        y0 = 0
+    if x1 > width:
+        shift = x1 - width
+        x0 = max(0, x0 - shift)
+        x1 = width
+    if y1 > height:
+        shift = y1 - height
+        y0 = max(0, y0 - shift)
+        y1 = height
+    crop = image[y0:y1, x0:x1].copy()
+    return crop, (center_x - x0, center_y - y0)
+
+
+def _draw_corner_magnifier(
+    canvas: np.ndarray,
+    image: np.ndarray,
+    cursor_x: int,
+    cursor_y: int,
+    label: str,
+    crop_size: int = 31,
+    inset_size: int = 240,
+    margin: int = 16,
+) -> np.ndarray:
+    crop, focal = _extract_magnifier_crop(image, cursor_x, cursor_y, crop_size=crop_size)
+    if crop.size == 0:
+        return canvas
+    inset = cv2.resize(crop, (inset_size, inset_size), interpolation=cv2.INTER_NEAREST)
+    scale_x = inset_size / max(crop.shape[1], 1)
+    scale_y = inset_size / max(crop.shape[0], 1)
+    focal_x = int(round((focal[0] + 0.5) * scale_x))
+    focal_y = int(round((focal[1] + 0.5) * scale_y))
+    cv2.line(inset, (focal_x, 0), (focal_x, inset_size - 1), (0, 255, 255), 1, cv2.LINE_AA)
+    cv2.line(inset, (0, focal_y), (inset_size - 1, focal_y), (0, 255, 255), 1, cv2.LINE_AA)
+    cv2.circle(inset, (focal_x, focal_y), 4, (0, 255, 255), 1, cv2.LINE_AA)
+    cv2.rectangle(inset, (0, 0), (inset_size - 1, inset_size - 1), (255, 255, 255), 2)
+    info_h = 58
+    panel_h = inset_size + info_h
+    panel = np.full((panel_h, inset_size, 3), 18, dtype=np.uint8)
+    panel[:inset_size, :, :] = inset
+    cv2.putText(panel, label, (10, inset_size + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(
+        panel,
+        f"({cursor_x}, {cursor_y})",
+        (10, inset_size + 46),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    h, w = canvas.shape[:2]
+    panel_h = min(panel.shape[0], h - margin)
+    panel_w = min(panel.shape[1], w - margin)
+    panel = panel[:panel_h, :panel_w]
+    x0 = max(margin, w - panel_w - margin)
+    y0 = max(margin, margin)
+    canvas[y0 : y0 + panel_h, x0 : x0 + panel_w] = panel
+    cv2.rectangle(canvas, (x0 - 2, y0 - 2), (x0 + panel_w + 1, y0 + panel_h + 1), (0, 255, 255), 2)
+    return canvas
+
+
 def manual_select_corners(
     image: np.ndarray,
     title: str = "Click board corners",
@@ -154,6 +232,7 @@ def build_manual_calibration(
     rows: int,
     cols: int,
     corners: list[Point],
+    group_size: int = 2,
     source: str = "manual-corners",
 ) -> Calibration:
     if len(corners) != 4:
@@ -191,11 +270,17 @@ def build_manual_calibration(
         board_rect=board_rect,
         rows=rows,
         cols=cols,
+        group_size=max(2, min(group_size, 4)),
         pitch_x=float(pitch_x),
         pitch_y=float(pitch_y),
         offset_x=0.0,
         offset_y=0.0,
         board_corners=[Point(point.x, point.y) for point in corners],
+        anchor_rows=rows,
+        anchor_cols=cols,
+        anchor_pitch_x=float(pitch_x),
+        anchor_pitch_y=float(pitch_y),
+        anchor_corners=[Point(point.x, point.y) for point in corners],
         client_width=int(image_width),
         client_height=int(image_height),
         rectified_width=int(rectified_width),
@@ -205,8 +290,119 @@ def build_manual_calibration(
     )
 
 
-def calibrate_grid(image: np.ndarray, rows: int, cols: int, corners: list[Point], source: str = "manual-corners") -> Calibration:
-    return build_manual_calibration((image.shape[1], image.shape[0]), rows=rows, cols=cols, corners=corners, source=source)
+def calibrate_grid(
+    image: np.ndarray,
+    rows: int,
+    cols: int,
+    corners: list[Point],
+    group_size: int = 2,
+    source: str = "manual-corners",
+) -> Calibration:
+    return build_manual_calibration(
+        (image.shape[1], image.shape[0]),
+        rows=rows,
+        cols=cols,
+        corners=corners,
+        group_size=group_size,
+        source=source,
+    )
+
+
+def _destination_corners(width: float, height: float) -> np.ndarray:
+    return np.array(
+        [[0.0, 0.0], [float(width), 0.0], [float(width), float(height)], [0.0, float(height)]],
+        dtype=np.float32,
+    )
+
+
+def _centers_from_projected_corners(
+    corners: list[Point],
+    rows: int,
+    cols: int,
+    pitch_x: float,
+    pitch_y: float,
+) -> list[CellCenter]:
+    rectified_width = pitch_x * max(cols, 1)
+    rectified_height = pitch_y * max(rows, 1)
+    board_to_source = cv2.getPerspectiveTransform(_destination_corners(rectified_width, rectified_height), _point_array(corners))
+    board_centers = np.array(
+        [[[(col + 0.5) * pitch_x, (row + 0.5) * pitch_y]] for row in range(rows) for col in range(cols)],
+        dtype=np.float32,
+    )
+    projected_centers = cv2.perspectiveTransform(board_centers, board_to_source).reshape(-1, 2)
+    return [
+        CellCenter(row=row, col=col, x=float(projected_centers[row * cols + col][0]), y=float(projected_centers[row * cols + col][1]))
+        for row in range(rows)
+        for col in range(cols)
+    ]
+
+
+def derive_center_anchored_calibration(
+    base_calibration: Calibration,
+    rows: int,
+    cols: int,
+    group_size: int | None = None,
+    source: str = "manual-editor",
+) -> Calibration:
+    anchor_rows = base_calibration.anchor_rows or base_calibration.rows
+    anchor_cols = base_calibration.anchor_cols or base_calibration.cols
+    anchor_pitch_x = base_calibration.anchor_pitch_x or base_calibration.pitch_x
+    anchor_pitch_y = base_calibration.anchor_pitch_y or base_calibration.pitch_y
+    anchor_corners = base_calibration.anchor_corners or base_calibration.board_corners
+
+    anchor_width = anchor_pitch_x * max(anchor_cols, 1)
+    anchor_height = anchor_pitch_y * max(anchor_rows, 1)
+    new_width = anchor_pitch_x * max(cols, 1)
+    new_height = anchor_pitch_y * max(rows, 1)
+    offset_x = (anchor_width - new_width) / 2.0
+    offset_y = (anchor_height - new_height) / 2.0
+
+    anchor_to_source = cv2.getPerspectiveTransform(_destination_corners(anchor_width, anchor_height), _point_array(anchor_corners))
+    new_rect = np.array(
+        [
+            [offset_x, offset_y],
+            [offset_x + new_width, offset_y],
+            [offset_x + new_width, offset_y + new_height],
+            [offset_x, offset_y + new_height],
+        ],
+        dtype=np.float32,
+    ).reshape(-1, 1, 2)
+    projected_corners = cv2.perspectiveTransform(new_rect, anchor_to_source).reshape(-1, 2)
+    corners = [Point(float(point[0]), float(point[1])) for point in projected_corners]
+    board_rect = _board_rect_from_corners(corners)
+    rectified_width = max(int(round(new_width)), cols)
+    rectified_height = max(int(round(new_height)), rows)
+    pitch_x = rectified_width / max(cols, 1)
+    pitch_y = rectified_height / max(rows, 1)
+    centers = _centers_from_projected_corners(corners, rows=rows, cols=cols, pitch_x=pitch_x, pitch_y=pitch_y)
+    polygon = np.array([[point.x, point.y] for point in corners], dtype=np.float32)
+    for center in centers:
+        if cv2.pointPolygonTest(polygon, (center.x, center.y), False) < 0:
+            raise RuntimeError(
+                f"Derived board center r{center.row:02d}c{center.col:02d} fell outside the calibrated playfield."
+            )
+    return Calibration(
+        board_rect=board_rect,
+        rows=rows,
+        cols=cols,
+        group_size=max(2, min(group_size if group_size is not None else base_calibration.group_size, 4)),
+        pitch_x=float(pitch_x),
+        pitch_y=float(pitch_y),
+        offset_x=0.0,
+        offset_y=0.0,
+        board_corners=corners,
+        anchor_rows=anchor_rows,
+        anchor_cols=anchor_cols,
+        anchor_pitch_x=float(anchor_pitch_x),
+        anchor_pitch_y=float(anchor_pitch_y),
+        anchor_corners=[Point(point.x, point.y) for point in anchor_corners],
+        client_width=base_calibration.client_width,
+        client_height=base_calibration.client_height,
+        rectified_width=int(rectified_width),
+        rectified_height=int(rectified_height),
+        source=source,
+        centers=centers,
+    )
 
 
 def _calibration_source_corners(calibration: Calibration, image_origin: tuple[int, int] = (0, 0)) -> np.ndarray:
@@ -271,16 +467,23 @@ def cell_center(calibration: Calibration, row: int, col: int) -> tuple[float, fl
 
 def offset_calibration(calibration: Calibration, dx: float, dy: float) -> Calibration:
     shifted_corners = [Point(point.x + dx, point.y + dy) for point in calibration.board_corners]
+    shifted_anchor_corners = [Point(point.x + dx, point.y + dy) for point in calibration.anchor_corners]
     shifted_centers = [CellCenter(row=center.row, col=center.col, x=center.x + dx, y=center.y + dy) for center in calibration.centers]
     return Calibration(
         board_rect=Rect(calibration.board_rect.x + int(round(dx)), calibration.board_rect.y + int(round(dy)), calibration.board_rect.width, calibration.board_rect.height),
         rows=calibration.rows,
         cols=calibration.cols,
+        group_size=calibration.group_size,
         pitch_x=calibration.pitch_x,
         pitch_y=calibration.pitch_y,
         offset_x=calibration.offset_x,
         offset_y=calibration.offset_y,
         board_corners=shifted_corners,
+        anchor_rows=calibration.anchor_rows,
+        anchor_cols=calibration.anchor_cols,
+        anchor_pitch_x=calibration.anchor_pitch_x,
+        anchor_pitch_y=calibration.anchor_pitch_y,
+        anchor_corners=shifted_anchor_corners,
         client_width=calibration.client_width,
         client_height=calibration.client_height,
         rectified_width=calibration.rectified_width,
@@ -288,6 +491,208 @@ def offset_calibration(calibration: Calibration, dx: float, dy: float) -> Calibr
         source=calibration.source,
         centers=shifted_centers,
     )
+
+
+def edit_calibration(
+    image: np.ndarray,
+    initial_rows: int,
+    initial_cols: int,
+    initial_group_size: int = 2,
+    existing_calibration: Calibration | None = None,
+    title: str = "Calibration Editor",
+) -> Calibration:
+    window_name = title
+    arrow_left = 2424832
+    arrow_up = 2490368
+    arrow_right = 2555904
+    arrow_down = 2621440
+
+    rows = max(1, int(initial_rows))
+    cols = max(1, int(initial_cols))
+    group_size = max(2, min(int(initial_group_size), 4))
+    points = [Point(point.x, point.y) for point in (existing_calibration.board_corners if existing_calibration else [])]
+    cursor_x = image.shape[1] // 2
+    cursor_y = image.shape[0] // 2
+    reference_calibration = existing_calibration
+    preview_calibration = existing_calibration if existing_calibration is not None else None
+    corner_mode = preview_calibration is None
+
+    def focus_window() -> None:
+        try:
+            hwnd = win32gui.FindWindow(None, window_name)
+            if not hwnd:
+                return
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE,
+            )
+            bring_window_to_front(hwnd)
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE,
+            )
+        except Exception:
+            return
+
+    def rebuild_from_points() -> None:
+        nonlocal reference_calibration, preview_calibration, corner_mode
+        if len(points) != 4:
+            preview_calibration = None
+            corner_mode = True
+            return
+        reference_calibration = build_manual_calibration(
+            (image.shape[1], image.shape[0]),
+            rows=rows,
+            cols=cols,
+            corners=points,
+            group_size=group_size,
+            source="manual-corners",
+        )
+        preview_calibration = reference_calibration
+        corner_mode = False
+
+    def rebuild_from_reference() -> None:
+        nonlocal preview_calibration
+        if reference_calibration is None:
+            preview_calibration = None
+            return
+        preview_calibration = build_manual_calibration(
+            (image.shape[1], image.shape[0]),
+            rows=rows,
+            cols=cols,
+            corners=reference_calibration.board_corners,
+            group_size=group_size,
+            source="manual-editor",
+        )
+
+    def redraw() -> None:
+        canvas = image.copy()
+        if preview_calibration is not None:
+            canvas = _render_grid_fit_overlay(canvas, preview_calibration)
+        instructions = [
+            "Calibration editor: arrow keys rows/cols, -/= max group size, C re-picks corners.",
+            "Enter saves. Backspace undoes in corner mode. R resets. Esc cancels.",
+            f"Rows: {rows}  Cols: {cols}  Max group size: {group_size}",
+            f"Mode: {'corner-pick' if corner_mode else 'overlay-edit'}",
+        ]
+        for index, line in enumerate(instructions):
+            cv2.putText(canvas, line, (16, 30 + index * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 255, 255), 2, cv2.LINE_AA)
+        if corner_mode:
+            labels = ["TL", "TR", "BR", "BL"]
+            progress = f"Captured corners: {len(points)}/4"
+            cv2.putText(canvas, progress, (16, 30 + len(instructions) * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 255, 0), 2, cv2.LINE_AA)
+            for index, point in enumerate(points):
+                xy = (int(round(point.x)), int(round(point.y)))
+                cv2.circle(canvas, xy, 6, (0, 255, 0), -1)
+                cv2.putText(canvas, labels[index], (xy[0] + 8, xy[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+            if len(points) >= 2:
+                poly = np.array([[int(round(point.x)), int(round(point.y))] for point in points], dtype=np.int32)
+                cv2.polylines(canvas, [poly], False, (0, 255, 0), 2, cv2.LINE_AA)
+            current_label = f"Pick {labels[min(len(points), 3)]}"
+            canvas = _draw_corner_magnifier(canvas, image, cursor_x, cursor_y, current_label)
+        cv2.imshow(window_name, canvas)
+
+    def on_mouse(event: int, x: int, y: int, _flags: int, _param: object) -> None:
+        nonlocal corner_mode, cursor_x, cursor_y
+        cursor_x = int(np.clip(x, 0, max(image.shape[1] - 1, 0)))
+        cursor_y = int(np.clip(y, 0, max(image.shape[0] - 1, 0)))
+        if event == cv2.EVENT_MOUSEMOVE:
+            if corner_mode:
+                redraw()
+            return
+        if event == cv2.EVENT_LBUTTONDOWN and corner_mode and len(points) < 4:
+            points.append(Point(float(cursor_x), float(cursor_y)))
+            labels = ["top-left", "top-right", "bottom-right", "bottom-left"]
+            print(f"Captured {labels[len(points) - 1]} corner at ({cursor_x}, {cursor_y}).")
+            if len(points) == 4:
+                rebuild_from_points()
+            redraw()
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(window_name, on_mouse)
+    redraw()
+    cv2.waitKey(1)
+    focus_window()
+    print("Calibration editor is active.")
+    try:
+        while True:
+            key = cv2.waitKeyEx(20)
+            if key in (-1, 0xFFFFFFFF):
+                continue
+            if key in (13, 10, 32):
+                if preview_calibration is None:
+                    print("Complete corner capture before saving.")
+                    continue
+                return preview_calibration
+            if key == 27:
+                raise RuntimeError("Calibration editor was cancelled.")
+            if key in (arrow_left, arrow_right, arrow_up, arrow_down):
+                if key == arrow_left:
+                    cols = max(1, cols - 1)
+                elif key == arrow_right:
+                    cols += 1
+                elif key == arrow_up:
+                    rows += 1
+                else:
+                    rows = max(1, rows - 1)
+                if reference_calibration is not None:
+                    rebuild_from_reference()
+                redraw()
+                continue
+            if key in (ord("-"), ord("_"), ord("["), ord("{")):
+                group_size = max(2, group_size - 1)
+                if preview_calibration is not None and reference_calibration is not None:
+                    rebuild_from_reference()
+                redraw()
+                continue
+            if key in (ord("="), ord("+"), ord("]"), ord("}")):
+                group_size = min(4, group_size + 1)
+                if preview_calibration is not None and reference_calibration is not None:
+                    rebuild_from_reference()
+                redraw()
+                continue
+            if key in (ord("c"), ord("C")):
+                corner_mode = True
+                preview_calibration = None
+                reference_calibration = None
+                points = []
+                print("Corner re-pick mode enabled.")
+                redraw()
+                continue
+            if key in (8, 127):
+                if corner_mode and points:
+                    removed = points.pop()
+                    print(f"Removed last corner at ({int(round(removed.x))}, {int(round(removed.y))}).")
+                    preview_calibration = None
+                    redraw()
+                elif not corner_mode and preview_calibration is not None:
+                    corner_mode = True
+                    points = [Point(point.x, point.y) for point in preview_calibration.board_corners[:-1]]
+                    preview_calibration = None
+                    print("Returned to corner editing mode.")
+                    redraw()
+                continue
+            if key in (ord("r"), ord("R")):
+                print("Resetting calibration editor.")
+                points = []
+                reference_calibration = None
+                preview_calibration = None
+                corner_mode = True
+                redraw()
+                continue
+    finally:
+        cv2.destroyWindow(window_name)
 
 
 def _cell_crop(image: np.ndarray, calibration: Calibration, row: int, col: int, inset: float = 0.18) -> np.ndarray | None:
@@ -658,7 +1063,7 @@ def _render_grid_fit_overlay(image: np.ndarray, calibration: Calibration) -> np.
         )
 
     label = (
-        f"{calibration.cols} cols x {calibration.rows} rows | "
+        f"{calibration.cols} cols x {calibration.rows} rows x {calibration.group_size} | "
         f"pitch {calibration.pitch_x:.2f} x {calibration.pitch_y:.2f}"
     )
     label_x = calibration.board_rect.x
@@ -694,11 +1099,27 @@ def _ordered_group_members(members: list[str], observations: dict[str, CellObser
     return ordered, positions
 
 
+def enforce_required_group_size(result: ReconstructionResult, required_group_size: int | None) -> ReconstructionResult:
+    if required_group_size is None:
+        return result
+    kept_groups: list[MatchGroup] = []
+    extra_unresolved: set[str] = set(result.unresolved)
+    for group in result.groups:
+        if group.group_size == required_group_size:
+            kept_groups.append(group)
+        else:
+            extra_unresolved.update(group.members)
+    result.groups = kept_groups
+    result.unresolved = sorted(extra_unresolved)
+    return result
+
+
 def reconstruct_from_images(
     image_paths: list[Path],
     session_dir: Path,
     config: MatchTileConfig,
     calibration: Calibration,
+    required_group_size: int | None = None,
 ) -> ReconstructionResult:
     images = [load_image(path) for path in image_paths]
     if not images:
@@ -819,6 +1240,7 @@ def reconstruct_from_images(
         unresolved=unresolved,
         session_dir=str(session_dir),
     )
+    result = enforce_required_group_size(result, required_group_size)
     fit_debug_path = render_grid_fit_debug(calibration_image, calibration, session_dir / "grid_fit_debug.png")
     result.grid_fit_debug_path = str(fit_debug_path)
     composed_path, debug_path = render_debug_grids(result, session_dir)
@@ -1038,9 +1460,20 @@ def infer_match_groups(
     return groups, unresolved
 
 
-def reconstruct_from_session(session_dir: Path, config: MatchTileConfig, calibration: Calibration) -> ReconstructionResult:
+def reconstruct_from_session(
+    session_dir: Path,
+    config: MatchTileConfig,
+    calibration: Calibration,
+    required_group_size: int | None = None,
+) -> ReconstructionResult:
     frames_dir = session_dir / "frames"
     image_paths = sorted(frames_dir.glob("*.png"))
-    result = reconstruct_from_images(image_paths, session_dir=session_dir, config=config, calibration=calibration)
+    result = reconstruct_from_images(
+        image_paths,
+        session_dir=session_dir,
+        config=config,
+        calibration=calibration,
+        required_group_size=required_group_size,
+    )
     result.save(session_dir / "result.json")
     return result
