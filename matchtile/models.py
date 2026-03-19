@@ -90,6 +90,13 @@ class CellObservation:
     reveal_score: float
     sharpness: float
     crop_path: str | None = None
+    state: str = "fully-revealed"
+    quality_score: float = 0.0
+    visible_width_ratio: float = 0.0
+    occupancy_ratio: float = 0.0
+    alternate_candidates: list[dict] = field(default_factory=list)
+    discarded_candidates: list[dict] = field(default_factory=list)
+    timeline: list[dict] = field(default_factory=list)
 
     def cell_id(self) -> str:
         return f"r{self.row:02d}c{self.col:02d}"
@@ -102,6 +109,10 @@ class MatchGroup:
     confidence: float
     ambiguous: bool = False
     group_size: int = 2
+    click_order: list[str] = field(default_factory=list)
+    click_order_positions: list[dict] = field(default_factory=list)
+    similarity_min: float = 0.0
+    similarity_mean: float = 0.0
 
 
 @dataclass(slots=True)
@@ -114,6 +125,8 @@ class ReconstructionResult:
     grid_composed_path: str | None = None
     grid_debug_path: str | None = None
     grid_fit_debug_path: str | None = None
+    candidate_debug_path: str | None = None
+    solve_order_path: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -125,6 +138,8 @@ class ReconstructionResult:
             "grid_composed_path": self.grid_composed_path,
             "grid_debug_path": self.grid_debug_path,
             "grid_fit_debug_path": self.grid_fit_debug_path,
+            "candidate_debug_path": self.candidate_debug_path,
+            "solve_order_path": self.solve_order_path,
         }
 
     @classmethod
@@ -142,6 +157,10 @@ class ReconstructionResult:
                     confidence=group["confidence"],
                     ambiguous=group.get("ambiguous", False),
                     group_size=group.get("group_size", len(group["members"])),
+                    click_order=group.get("click_order", group["members"]),
+                    click_order_positions=group.get("click_order_positions", []),
+                    similarity_min=group.get("similarity_min", 0.0),
+                    similarity_mean=group.get("similarity_mean", 0.0),
                 )
                 for group in raw_groups
             ],
@@ -150,6 +169,8 @@ class ReconstructionResult:
             grid_composed_path=data.get("grid_composed_path"),
             grid_debug_path=data.get("grid_debug_path"),
             grid_fit_debug_path=data.get("grid_fit_debug_path"),
+            candidate_debug_path=data.get("candidate_debug_path"),
+            solve_order_path=data.get("solve_order_path"),
         )
 
     def save(self, path: Path) -> None:

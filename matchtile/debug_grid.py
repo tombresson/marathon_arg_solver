@@ -41,6 +41,16 @@ def _group_lookup(result: ReconstructionResult) -> dict[str, tuple[str, float, b
     return lookup
 
 
+def _load_candidate_tile(candidate: dict | None, width: int, height: int, row: int, col: int) -> np.ndarray:
+    if candidate:
+        crop_path = candidate.get("crop_path")
+        if crop_path:
+            crop = cv2.imread(crop_path, cv2.IMREAD_COLOR)
+            if crop is not None:
+                return cv2.resize(crop, (width, height), interpolation=cv2.INTER_AREA)
+    return _placeholder_tile(width, height, row, col)
+
+
 def render_debug_grids(result: ReconstructionResult, output_dir: Path) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     tile_w, tile_h = _tile_size(result)
@@ -127,3 +137,85 @@ def render_debug_grids(result: ReconstructionResult, output_dir: Path) -> tuple[
     cv2.imwrite(str(composed_path), composed)
     cv2.imwrite(str(debug_path), annotated)
     return composed_path, debug_path
+
+
+def render_candidate_debug(result: ReconstructionResult, output_dir: Path, max_cells: int = 18) -> Path | None:
+    interesting: list[tuple[str, object]] = []
+    for cell_id, observation in result.observations.items():
+        if observation.alternate_candidates or observation.discarded_candidates or observation.state != "fully-revealed":
+            interesting.append((cell_id, observation))
+    if not interesting:
+        return None
+
+    interesting.sort(
+        key=lambda item: (
+            item[1].state != "fully-revealed",
+            len(item[1].discarded_candidates),
+            len(item[1].alternate_candidates),
+            item[1].quality_score,
+        ),
+        reverse=True,
+    )
+    interesting = interesting[:max_cells]
+
+    tile_w, tile_h = _tile_size(result)
+    label_h = 40
+    cell_w = tile_w * 5 + 24
+    rows = len(interesting)
+    canvas = np.full((rows * (tile_h + label_h), cell_w, 3), 14, dtype=np.uint8)
+
+    for row_index, (cell_id, observation) in enumerate(interesting):
+        y0 = row_index * (tile_h + label_h)
+        cv2.putText(
+            canvas,
+            f"{cell_id} | {observation.state} | q={observation.quality_score:.2f}",
+            (8, y0 + 14),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            canvas,
+            "chosen         alt1           alt2           drop1          drop2",
+            (8, y0 + 31),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (150, 200, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        slots = [
+            {
+                "crop_path": observation.crop_path,
+                "state": observation.state,
+                "frame_index": observation.frame_index,
+                "quality_score": observation.quality_score,
+            },
+            *observation.alternate_candidates[:2],
+            *observation.discarded_candidates[:2],
+        ]
+        while len(slots) < 5:
+            slots.append(None)
+        for slot_index, candidate in enumerate(slots):
+            x0 = 8 + slot_index * tile_w
+            tile = _load_candidate_tile(candidate, tile_w - 2, tile_h - 2, observation.row, observation.col)
+            canvas[y0 + label_h : y0 + label_h + tile_h - 2, x0 : x0 + tile_w - 2] = tile
+            cv2.rectangle(canvas, (x0, y0 + label_h), (x0 + tile_w - 2, y0 + label_h + tile_h - 2), (60, 60, 60), 1)
+            if candidate:
+                label = f"f{candidate.get('frame_index', -1)} {candidate.get('state', '?')[:6]}"
+                cv2.putText(
+                    canvas,
+                    label,
+                    (x0 + 1, y0 + label_h + tile_h + 11),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.28,
+                    (210, 210, 210),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+    output_path = output_dir / "candidate_debug.png"
+    cv2.imwrite(str(output_path), canvas)
+    return output_path

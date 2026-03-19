@@ -65,6 +65,36 @@ def _image_calibration_path(image_path: Path) -> Path:
     return image_path.with_suffix(".calibration.json")
 
 
+def _format_group_click_order(group) -> str:
+    if group.click_order_positions:
+        return " -> ".join(f"r{item['row']:02d}c{item['col']:02d}" for item in group.click_order_positions)
+    ordered = group.click_order or group.members
+    return " -> ".join(ordered)
+
+
+def _write_solve_order(result: ReconstructionResult, output_dir: Path) -> Path:
+    lines: list[str] = []
+    ordered_groups = sorted(result.groups, key=lambda group: (-group.group_size, -group.confidence, group.label))
+    for group in ordered_groups:
+        lines.append(
+            f"{group.label} size {group.group_size} conf {group.confidence:.3f} "
+            f"sim_min {group.similarity_min:.3f} sim_mean {group.similarity_mean:.3f}: "
+            f"{_format_group_click_order(group)}"
+        )
+    output_path = output_dir / "solve_order.txt"
+    output_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return output_path
+
+
+def _print_group_summary(result: ReconstructionResult) -> None:
+    ordered_groups = sorted(result.groups, key=lambda group: (-group.group_size, -group.confidence, group.label))
+    interesting = [group for group in ordered_groups if group.group_size >= 3]
+    if not interesting:
+        interesting = ordered_groups[:10]
+    for group in interesting:
+        print(f"{group.label} size {group.group_size}: {_format_group_click_order(group)}")
+
+
 def _load_replay_calibration(args: argparse.Namespace, config: MatchTileConfig) -> Calibration:
     if args.calibration:
         return load_calibration(args.calibration)
@@ -139,21 +169,31 @@ def cmd_replay(args: argparse.Namespace, config: MatchTileConfig) -> int:
     calibration = _load_replay_calibration(args, config)
     if args.session:
         result = reconstruct_from_session(args.session, config, calibration=calibration)
+        solve_order_path = _write_solve_order(result, args.session)
+        result.solve_order_path = str(solve_order_path)
+        result.save(args.session / "result.json")
         print(f"Reconstructed session into {args.session / 'result.json'}")
     else:
         session_dir = create_session_dir(config)
         result = reconstruct_from_images(args.images or [], session_dir=session_dir, config=config, calibration=calibration)
         save_calibration(session_dir / "calibration.json", calibration)
+        solve_order_path = _write_solve_order(result, session_dir)
+        result.solve_order_path = str(solve_order_path)
         result.save(session_dir / "result.json")
         print(f"Reconstructed images into {session_dir / 'result.json'}")
     print(f"Calibration source: {calibration.source}")
     print(f"Groups: {len(result.groups)} | Unresolved: {len(result.unresolved)}")
+    _print_group_summary(result)
     if result.grid_fit_debug_path:
         print(f"Grid fit debug: {result.grid_fit_debug_path}")
     if result.grid_composed_path:
         print(f"Composed grid: {result.grid_composed_path}")
     if result.grid_debug_path:
         print(f"Debug grid: {result.grid_debug_path}")
+    if result.candidate_debug_path:
+        print(f"Candidate debug: {result.candidate_debug_path}")
+    if result.solve_order_path:
+        print(f"Solve order: {result.solve_order_path}")
     return 0
 
 
@@ -216,15 +256,22 @@ def cmd_arm(args: argparse.Namespace, config: MatchTileConfig) -> int:
 
         print("Reconstructing board and matching groups...")
         result = reconstruct_from_session(session_dir, config, calibration=calibration)
+        solve_order_path = _write_solve_order(result, session_dir)
+        result.solve_order_path = str(solve_order_path)
         result.save(session_dir / "result.json")
         print(f"Captured {metadata.frame_count} frames into {session_dir}")
         print(f"Groups: {len(result.groups)} | Unresolved: {len(result.unresolved)}")
+        _print_group_summary(result)
         if result.grid_fit_debug_path:
             print(f"Grid fit debug: {result.grid_fit_debug_path}")
         if result.grid_composed_path:
             print(f"Composed grid: {result.grid_composed_path}")
         if result.grid_debug_path:
             print(f"Debug grid: {result.grid_debug_path}")
+        if result.candidate_debug_path:
+            print(f"Candidate debug: {result.candidate_debug_path}")
+        if result.solve_order_path:
+            print(f"Solve order: {result.solve_order_path}")
 
         min_confidence = args.autoplay_min_confidence or config.group_confidence_threshold
         if args.autoplay:

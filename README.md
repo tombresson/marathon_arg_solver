@@ -46,5 +46,7 @@ matchtile overlay --session sessions\20260319-013000 --window "NULL//TRANSMIT.ER
 - `F12` is a global emergency stop for `arm`, overlay mode, and auto-click mode.
 - `arm --autoplay` clicks only high-confidence match groups by default and aborts if the post-click verification does not detect the expected board change.
 - Every session stores raw frames, `calibration.json`, and reconstruction JSON in `sessions/`.
-- Every solve also writes `grid_fit_debug.png`, `grid_composed.png`, and `grid_debug.png` into the session directory for debugging.
-- The matching pipeline is intentionally conservative. Ambiguous groups stay visible with lower confidence instead of being hidden.
+- Every solve also writes `grid_fit_debug.png`, `grid_composed.png`, `grid_debug.png`, `candidate_debug.png`, and `solve_order.txt` into the session directory for debugging.
+- Reconstruction now hard-rejects horizontal squeeze transition frames and only chooses crops from fully-open reveal plateaus.
+- Group output now keeps a stable click order (top-left first, then row-major) and prints 3- and 4-match solve sequences to the console after reconstruction.
+- The matching pipeline is intentionally conservative. Ambiguous candidate groups stay unresolved instead of being forced into clicks.

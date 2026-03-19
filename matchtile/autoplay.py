@@ -79,7 +79,8 @@ def auto_click_groups(
     for group in groups:
         if stop_token:
             stop_token.checkpoint()
-        for cell_id in group.members:
+        click_sequence = group.click_order or group.members
+        for cell_id in click_sequence:
             point = _cell_screen_point(result, cell_id, screen_offset)
             controller.position = point
             if stop_token:
