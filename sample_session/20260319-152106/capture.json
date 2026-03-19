@@ -1,0 +1,13 @@
+{
+  "fps": 18,
+  "duration_s": 21.0,
+  "frame_count": 190,
+  "capture_rect": {
+    "x": 16,
+    "y": 16,
+    "width": 2556,
+    "height": 1360
+  },
+  "window_title": "NULL//TRANSMIT.ERR",
+  "calibration_path": "calibrations\\NULL_TRANSMIT.ERR_2556x1360.calibration.json"
+}

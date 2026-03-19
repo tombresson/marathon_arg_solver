@@ -1,0 +1,39 @@
+G027 size 3 conf 0.839 sim_min 0.892 sim_mean 0.925: r00c04 -> r11c07 -> r11c08
+G038 size 2 conf 0.857 sim_min 0.924 sim_mean 0.924: r00c06 -> r07c16
+G036 size 2 conf 0.883 sim_min 0.942 sim_mean 0.942: r00c09 -> r00c11
+G035 size 3 conf 0.828 sim_min 0.876 sim_mean 0.910: r00c10 -> r01c11 -> r06c20
+G022 size 3 conf 0.847 sim_min 0.907 sim_mean 0.943: r00c13 -> r09c18 -> r09c20
+G020 size 3 conf 0.850 sim_min 0.919 sim_mean 0.929: r00c18 -> r04c18 -> r06c10
+G029 size 3 conf 0.836 sim_min 0.891 sim_mean 0.913: r01c00 -> r02c07 -> r06c08
+G028 size 3 conf 0.838 sim_min 0.885 sim_mean 0.916: r01c03 -> r02c16 -> r06c13
+G034 size 3 conf 0.831 sim_min 0.886 sim_mean 0.904: r01c04 -> r07c19 -> r08c05
+G025 size 3 conf 0.841 sim_min 0.892 sim_mean 0.913: r01c06 -> r10c19 -> r11c10
+G030 size 3 conf 0.835 sim_min 0.886 sim_mean 0.902: r01c08 -> r04c20 -> r07c05
+G014 size 3 conf 0.857 sim_min 0.921 sim_mean 0.933: r01c15 -> r04c07 -> r06c18
+G032 size 3 conf 0.832 sim_min 0.878 sim_mean 0.903: r01c17 -> r05c10 -> r10c00
+G005 size 3 conf 0.878 sim_min 0.936 sim_mean 0.943: r01c19 -> r03c01 -> r11c03
+G024 size 3 conf 0.842 sim_min 0.897 sim_mean 0.921: r02c06 -> r10c04 -> r10c09
+G004 size 3 conf 0.880 sim_min 0.947 sim_mean 0.961: r02c12 -> r02c20 -> r09c07
+G018 size 3 conf 0.853 sim_min 0.914 sim_mean 0.937: r02c13 -> r04c16 -> r07c00
+G026 size 3 conf 0.841 sim_min 0.891 sim_mean 0.922: r02c18 -> r03c17 -> r06c01
+G031 size 3 conf 0.832 sim_min 0.882 sim_mean 0.910: r03c03 -> r05c03 -> r07c15
+G003 size 3 conf 0.880 sim_min 0.949 sim_mean 0.962: r03c05 -> r04c14 -> r05c08
+G010 size 3 conf 0.866 sim_min 0.924 sim_mean 0.949: r03c09 -> r03c16 -> r04c06
+G013 size 3 conf 0.860 sim_min 0.927 sim_mean 0.947: r03c20 -> r07c08 -> r08c17
+G015 size 3 conf 0.856 sim_min 0.923 sim_mean 0.939: r04c02 -> r09c02 -> r09c08
+G023 size 3 conf 0.847 sim_min 0.921 sim_mean 0.932: r04c04 -> r08c04 -> r11c15
+G008 size 3 conf 0.870 sim_min 0.931 sim_mean 0.944: r04c05 -> r07c12 -> r08c18
+G033 size 3 conf 0.831 sim_min 0.893 sim_mean 0.907: r04c08 -> r06c02 -> r09c19
+G021 size 3 conf 0.847 sim_min 0.872 sim_mean 0.899: r04c09 -> r07c06 -> r08c00
+G007 size 3 conf 0.876 sim_min 0.954 sim_mean 0.966: r04c15 -> r07c01 -> r07c10
+G016 size 3 conf 0.855 sim_min 0.926 sim_mean 0.945: r05c00 -> r07c03 -> r07c14
+G019 size 3 conf 0.851 sim_min 0.917 sim_mean 0.931: r05c17 -> r06c05 -> r11c13
+G012 size 3 conf 0.861 sim_min 0.918 sim_mean 0.928: r06c04 -> r08c01 -> r10c03
+G017 size 3 conf 0.853 sim_min 0.915 sim_mean 0.941: r06c07 -> r07c09 -> r09c15
+G039 size 2 conf 0.851 sim_min 0.912 sim_mean 0.912: r06c09 -> r08c02
+G002 size 3 conf 0.891 sim_min 0.950 sim_mean 0.957: r06c14 -> r08c12 -> r11c11
+G009 size 3 conf 0.868 sim_min 0.937 sim_mean 0.952: r06c17 -> r11c12 -> r11c16
+G037 size 2 conf 0.878 sim_min 0.938 sim_mean 0.938: r07c04 -> r10c15
+G006 size 3 conf 0.877 sim_min 0.955 sim_mean 0.962: r07c07 -> r10c07 -> r11c05
+G001 size 3 conf 0.899 sim_min 0.971 sim_mean 0.979: r08c07 -> r08c09 -> r08c19
+G011 size 3 conf 0.865 sim_min 0.937 sim_mean 0.950: r09c11 -> r10c17 -> r11c06
