@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import time
 from pathlib import Path
 
@@ -8,9 +9,36 @@ import mss
 import numpy as np
 from pynput.mouse import Button, Controller
 
+from matchtile.config import MatchTileConfig
 from matchtile.models import MatchGroup, ReconstructionResult
 from matchtile.runtime_control import StopToken
 from matchtile.vision import cell_center, warp_image_to_board
+
+
+def _jittered_delay(delay_s: float, jitter_s: float) -> float:
+    return max(0.0, delay_s + random.uniform(-jitter_s, jitter_s))
+
+
+def _sleep_with_stop(duration_s: float, stop_token: StopToken | None) -> None:
+    if stop_token:
+        stop_token.sleep(duration_s)
+    else:
+        time.sleep(duration_s)
+
+
+def _execute_click(
+    controller: Controller,
+    point: tuple[int, int],
+    move_settle_s: float,
+    mouse_down_hold_s: float,
+    timing_jitter_s: float,
+    stop_token: StopToken | None,
+) -> None:
+    controller.position = point
+    _sleep_with_stop(_jittered_delay(move_settle_s, timing_jitter_s), stop_token)
+    controller.press(Button.left)
+    _sleep_with_stop(_jittered_delay(mouse_down_hold_s, timing_jitter_s), stop_token)
+    controller.release(Button.left)
 
 
 def _cell_screen_point(result: ReconstructionResult, cell_id: str, screen_offset: tuple[int, int]) -> tuple[int, int]:
@@ -60,6 +88,9 @@ def auto_click_groups(
     result_path: Path,
     min_confidence: float,
     click_delay_s: float,
+    move_settle_s: float,
+    mouse_down_hold_s: float,
+    timing_jitter_s: float,
     verify: bool = True,
     include_ambiguous: bool = False,
     capture_rect: tuple[int, int, int, int] | None = None,
@@ -73,30 +104,36 @@ def auto_click_groups(
         for group in result.groups
         if group.confidence >= min_confidence and (include_ambiguous or not group.ambiguous)
     ]
-    groups.sort(key=lambda group: (group.confidence, group.group_size), reverse=True)
+    groups.sort(
+        key=lambda group: (
+            int(group.click_order_positions[0]["row"]) if group.click_order_positions else 9999,
+            int(group.click_order_positions[0]["col"]) if group.click_order_positions else 9999,
+            group.label,
+        )
+    )
 
     clicked = 0
     for group in groups:
         if stop_token:
             stop_token.checkpoint()
         click_sequence = group.click_order or group.members
+        print(f"{group.label} size {group.group_size}: ", end="", flush=True)
         for cell_id in click_sequence:
             point = _cell_screen_point(result, cell_id, screen_offset)
-            controller.position = point
-            if stop_token:
-                stop_token.sleep(click_delay_s / 2)
-            else:
-                time.sleep(click_delay_s / 2)
-            controller.click(Button.left, 1)
+            is_last = cell_id == click_sequence[-1]
+            print(cell_id, end="\n" if is_last else " -> ", flush=True)
+            _execute_click(
+                controller,
+                point,
+                move_settle_s=move_settle_s,
+                mouse_down_hold_s=mouse_down_hold_s,
+                timing_jitter_s=timing_jitter_s,
+                stop_token=stop_token,
+            )
             clicked += 1
-            if stop_token:
-                stop_token.sleep(click_delay_s)
-            else:
-                time.sleep(click_delay_s)
-        if stop_token:
-            stop_token.sleep(click_delay_s)
-        else:
-            time.sleep(click_delay_s)
+            _sleep_with_stop(_jittered_delay(click_delay_s, timing_jitter_s), stop_token)
+        group_delay = _jittered_delay(click_delay_s, timing_jitter_s)
+        _sleep_with_stop(group_delay, stop_token)
         if verify and capture_rect:
             if not _verify_group_change(result, group, capture_rect, screen_offset):
                 raise RuntimeError(

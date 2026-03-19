@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import argparse
-import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
 from matchtile.autoplay import auto_click_groups
 from matchtile.calibration_store import calibration_profile_path, load_calibration, save_calibration
-from matchtile.capture import capture_frame, capture_frames, wait_for_hotkey
+from matchtile.capture import capture_frame, wait_for_hotkey
 from matchtile.config import DEFAULT_CONFIG_PATH, MatchTileConfig
 from matchtile.models import Calibration, ReconstructionResult
 from matchtile.overlay import launch_overlay
+from matchtile.phantom_board import (
+    PHANTOM_BOARD_URL,
+    board_source_metadata,
+    build_reconstruction_from_phantom_board,
+    fetch_phantom_board,
+    load_phantom_board,
+    save_phantom_board,
+    wait_for_fresh_phantom_board,
+)
 from matchtile.runtime_control import AbortRequested, StopToken
 from matchtile.session import create_session_dir
 from matchtile.vision import (
@@ -32,20 +41,18 @@ def _parser() -> argparse.ArgumentParser:
     calibrate.add_argument("--image", type=Path)
     calibrate.add_argument("--window", type=str, default=None)
     calibrate.add_argument("--out", type=Path)
-    calibrate.add_argument("--col", type=int, required=True)
-    calibrate.add_argument("--row", type=int, required=True)
 
-    replay = subparsers.add_parser("replay", help="Reconstruct from a session directory or image list.")
+    replay = subparsers.add_parser("replay", help="Reconstruct from a session directory, website board JSON, or image list.")
     replay.add_argument("--session", type=Path)
     replay.add_argument("--images", nargs="+", type=Path)
+    replay.add_argument("--board-json", type=Path)
     replay.add_argument("--calibration", type=Path)
     replay.add_argument("--max-group-size", type=int, default=None)
 
-    arm = subparsers.add_parser("arm", help="Wait for a hotkey, capture the reveal burst, and reconstruct.")
+    arm = subparsers.add_parser("arm", help="Wait for a hotkey, fetch the live phantom board, and solve.")
     arm.add_argument("--window", type=str, default=None)
     arm.add_argument("--overlay", action="store_true")
     arm.add_argument("--start-now", action="store_true")
-    arm.add_argument("--reveal-duration", type=float, default=None)
     arm.add_argument("--max-group-size", type=int, default=None)
     arm.add_argument("--autoplay", action="store_true")
     arm.add_argument("--autoplay-min-confidence", type=float, default=None)
@@ -72,9 +79,17 @@ def _format_group_click_order(group) -> str:
     return " -> ".join(ordered)
 
 
+def _group_sort_key(group) -> tuple[int, int, str]:
+    if group.click_order_positions:
+        first = group.click_order_positions[0]
+        return int(first["row"]), int(first["col"]), group.label
+    first = (group.click_order or group.members or [group.label])[0]
+    return 9999, 9999, first
+
+
 def _write_solve_order(result: ReconstructionResult, output_dir: Path) -> Path:
     lines: list[str] = []
-    ordered_groups = sorted(result.groups, key=lambda group: (-group.group_size, -group.confidence, group.label))
+    ordered_groups = sorted(result.groups, key=_group_sort_key)
     for group in ordered_groups:
         lines.append(
             f"{group.label} size {group.group_size} conf {group.confidence:.3f} "
@@ -87,7 +102,7 @@ def _write_solve_order(result: ReconstructionResult, output_dir: Path) -> Path:
 
 
 def _print_group_summary(result: ReconstructionResult) -> None:
-    ordered_groups = sorted(result.groups, key=lambda group: (-group.group_size, -group.confidence, group.label))
+    ordered_groups = sorted(result.groups, key=_group_sort_key)
     interesting = [group for group in ordered_groups if group.group_size >= 3]
     if not interesting:
         interesting = ordered_groups[:10]
@@ -106,7 +121,7 @@ def _load_replay_calibration(args: argparse.Namespace, config: MatchTileConfig) 
             f"No calibration found for {args.session}. "
             "Pass --calibration <path> or replay a session created by `matchtile arm`."
         )
-    raise RuntimeError("Replay with --images requires --calibration <path>.")
+    raise RuntimeError("Replay with --images or --board-json requires --calibration <path>.")
 
 
 def _load_live_calibration(config: MatchTileConfig, title_regex: str) -> tuple[Calibration, str, tuple[int, int], object]:
@@ -115,10 +130,19 @@ def _load_live_calibration(config: MatchTileConfig, title_regex: str) -> tuple[C
     if not profile_path.exists():
         raise RuntimeError(
             "No saved calibration matched the current Discord window size. "
-            f"Run `matchtile calibrate --window \"{target.title}\" --col <cols> --row <rows>` first."
+            f"Run `matchtile calibrate --window \"{target.title}\"` first."
         )
     calibration = load_calibration(profile_path)
     return calibration, str(profile_path), (target.client_rect.x, target.client_rect.y), target
+
+
+def _resolve_replay_board(args: argparse.Namespace) -> tuple[str, object | None, Path | None]:
+    if args.board_json:
+        return "board-json", load_phantom_board(args.board_json), args.board_json
+    if args.session and (args.session / "phantom_board.json").exists():
+        board_path = args.session / "phantom_board.json"
+        return "session-phantom", load_phantom_board(board_path), board_path
+    return "legacy", None, None
 
 
 def _offset_for_overlay(calibration: Calibration, title_regex: str) -> tuple[int, int]:
@@ -135,8 +159,6 @@ def _offset_for_overlay(calibration: Calibration, title_regex: str) -> tuple[int
 def cmd_calibrate(args: argparse.Namespace, config: MatchTileConfig) -> int:
     if bool(args.image) == bool(args.window):
         raise RuntimeError("Calibration requires exactly one of --image or --window.")
-    if args.col <= 0 or args.row <= 0:
-        raise RuntimeError("--col and --row must both be positive integers.")
 
     if args.image:
         image = load_image(args.image)
@@ -150,10 +172,9 @@ def cmd_calibrate(args: argparse.Namespace, config: MatchTileConfig) -> int:
         out_path = args.out or calibration_profile_path(config, target.title, target.client_rect.width, target.client_rect.height)
         window_title = target.title
 
-    print(f"Calibration target: {args.col} cols x {args.row} rows")
     print("Click top-left, top-right, bottom-right, then bottom-left.")
-    corners, final_rows, final_cols = manual_select_corners(image, rows=args.row, cols=args.col)
-    calibration = build_manual_calibration((image.shape[1], image.shape[0]), rows=final_rows, cols=final_cols, corners=corners)
+    corners = manual_select_corners(image)
+    calibration = build_manual_calibration((image.shape[1], image.shape[0]), rows=1, cols=1, corners=corners)
     save_calibration(out_path, calibration)
     print(f"Saved calibration to {out_path}")
     if window_title:
@@ -166,8 +187,26 @@ def cmd_calibrate(args: argparse.Namespace, config: MatchTileConfig) -> int:
 def cmd_replay(args: argparse.Namespace, config: MatchTileConfig) -> int:
     if args.max_group_size is not None:
         config.max_group_size = max(2, min(args.max_group_size, 4))
+    replay_mode, board, board_path = _resolve_replay_board(args)
     calibration = _load_replay_calibration(args, config)
-    if args.session:
+    if replay_mode in {"board-json", "session-phantom"}:
+        if args.max_group_size is not None and args.max_group_size != board.pairSize:
+            raise RuntimeError(
+                f"--max-group-size {args.max_group_size} did not match phantom board pairSize {board.pairSize}."
+            )
+        if replay_mode == "session-phantom" and args.session:
+            session_dir = args.session
+        else:
+            session_dir = create_session_dir(config)
+            save_phantom_board(session_dir / "phantom_board.json", board)
+            save_calibration(session_dir / "calibration.json", calibration)
+        source = board_source_metadata(board, str(board_path or PHANTOM_BOARD_URL), mode=replay_mode, fetched_at=datetime.now(timezone.utc))
+        result = build_reconstruction_from_phantom_board(board, calibration, session_dir=session_dir, board_source=source)
+        solve_order_path = _write_solve_order(result, session_dir)
+        result.solve_order_path = str(solve_order_path)
+        result.save(session_dir / "result.json")
+        print(f"Reconstructed phantom board into {session_dir / 'result.json'}")
+    elif args.session:
         result = reconstruct_from_session(args.session, config, calibration=calibration)
         solve_order_path = _write_solve_order(result, args.session)
         result.solve_order_path = str(solve_order_path)
@@ -181,7 +220,7 @@ def cmd_replay(args: argparse.Namespace, config: MatchTileConfig) -> int:
         result.solve_order_path = str(solve_order_path)
         result.save(session_dir / "result.json")
         print(f"Reconstructed images into {session_dir / 'result.json'}")
-    print(f"Calibration source: {calibration.source}")
+    print(f"Calibration source: {result.calibration.source}")
     print(f"Groups: {len(result.groups)} | Unresolved: {len(result.unresolved)}")
     _print_group_summary(result)
     if result.grid_fit_debug_path:
@@ -201,9 +240,11 @@ def cmd_arm(args: argparse.Namespace, config: MatchTileConfig) -> int:
     if args.max_group_size is not None:
         config.max_group_size = max(2, min(args.max_group_size, 4))
     title_regex = args.window or config.window_title_regex
-    calibration, calibration_path, screen_offset, target = _load_live_calibration(config, title_regex)
-    reveal_duration = args.reveal_duration if args.reveal_duration is not None else config.reveal_duration_s
-    click_delay_s = 0.75
+    base_calibration, calibration_path, screen_offset, target = _load_live_calibration(config, title_regex)
+    click_delay_s = config.click_delay_s
+    move_settle_s = config.move_settle_s
+    mouse_down_hold_s = config.mouse_down_hold_s
+    timing_jitter_s = config.timing_jitter_s
     bring_window_to_front(target.hwnd)
     session_dir = create_session_dir(config)
     print(f"Target window: {target.title}")
@@ -214,52 +255,52 @@ def cmd_arm(args: argparse.Namespace, config: MatchTileConfig) -> int:
         f"({target.client_rect.x}, {target.client_rect.y})"
     )
     print(f"Session directory: {session_dir}")
-    print(
-        "Capture settings: "
-        f"{config.capture_fps} FPS for {reveal_duration:.2f}s "
-        f"(about {int(config.capture_fps * reveal_duration)} frames expected)"
-    )
 
     with StopToken() as stop_token:
+        print(f"Fetching baseline phantom board from {PHANTOM_BOARD_URL}...")
+        baseline_board = fetch_phantom_board()
+        print(
+            "Baseline board: "
+            f"{baseline_board.width}x{baseline_board.height}, "
+            f"pairSize {baseline_board.pairSize}, "
+            f"startedAt {baseline_board.startedAt or 'unknown'}"
+        )
         if not args.start_now:
             wait_for_hotkey(stop_token=stop_token)
-            print("Activating target window for capture.")
+            print("Activating target window for solve.")
             bring_window_to_front(target.hwnd)
         else:
-            print("Start-now enabled. Beginning reveal capture immediately.")
+            print("Start-now enabled. Polling for a fresh phantom board immediately.")
             bring_window_to_front(target.hwnd)
 
-        print("Capturing reveal frames...")
-        metadata = capture_frames(
-            target.client_rect,
-            fps=config.capture_fps,
-            duration_s=reveal_duration,
-            out_dir=session_dir,
+        print("Polling for a fresh phantom board...")
+        board = wait_for_fresh_phantom_board(
+            baseline_board,
+            url=PHANTOM_BOARD_URL,
+            poll_interval_s=0.25,
+            timeout_s=10.0,
             stop_token=stop_token,
         )
-        print(f"Capture complete. Saved {metadata.frame_count} frame(s).")
-        (session_dir / "capture.json").write_text(
-            json.dumps(
-                {
-                    "fps": metadata.fps,
-                    "duration_s": metadata.duration_s,
-                    "frame_count": metadata.frame_count,
-                    "capture_rect": metadata.capture_rect.as_dict(),
-                    "window_title": target.title,
-                    "calibration_path": calibration_path,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
+        print(
+            "Fresh board detected: "
+            f"{board.width}x{board.height}, "
+            f"pairSize {board.pairSize}, "
+            f"startedAt {board.startedAt or 'unknown'}"
         )
-        save_calibration(session_dir / "calibration.json", calibration)
+        if args.max_group_size is not None and args.max_group_size != board.pairSize:
+            raise RuntimeError(
+                f"--max-group-size {args.max_group_size} did not match phantom board pairSize {board.pairSize}."
+            )
+        board_source = board_source_metadata(board, PHANTOM_BOARD_URL, mode="live-api", fetched_at=datetime.now(timezone.utc))
+        save_phantom_board(session_dir / "phantom_board.json", board)
 
-        print("Reconstructing board and matching groups...")
-        result = reconstruct_from_session(session_dir, config, calibration=calibration)
+        print("Building exact groups from phantom board data...")
+        result = build_reconstruction_from_phantom_board(board, base_calibration, session_dir=session_dir, board_source=board_source)
+        save_calibration(session_dir / "calibration.json", result.calibration)
         solve_order_path = _write_solve_order(result, session_dir)
         result.solve_order_path = str(solve_order_path)
         result.save(session_dir / "result.json")
-        print(f"Captured {metadata.frame_count} frames into {session_dir}")
+        print(f"Saved phantom board session into {session_dir}")
         print(f"Groups: {len(result.groups)} | Unresolved: {len(result.unresolved)}")
         _print_group_summary(result)
         if result.grid_fit_debug_path:
@@ -279,12 +320,20 @@ def cmd_arm(args: argparse.Namespace, config: MatchTileConfig) -> int:
                 "Autoplay enabled. "
                 f"Clicking confident groups with threshold {min_confidence:.2f}"
                 + (" including ambiguous groups." if args.include_ambiguous else ".")
-                + f" Click delay: {click_delay_s:.2f}s."
+                + (
+                    f" Click delay: {click_delay_s:.3f}s. "
+                    f"Move settle: {move_settle_s:.3f}s. "
+                    f"Hold: {mouse_down_hold_s:.3f}s. "
+                    f"Jitter: +/-{timing_jitter_s:.3f}s."
+                )
             )
             clicked = auto_click_groups(
                 session_dir / "result.json",
                 min_confidence=min_confidence,
                 click_delay_s=click_delay_s,
+                move_settle_s=move_settle_s,
+                mouse_down_hold_s=mouse_down_hold_s,
+                timing_jitter_s=timing_jitter_s,
                 verify=True,
                 include_ambiguous=args.include_ambiguous,
                 capture_rect=(target.client_rect.x, target.client_rect.y, target.client_rect.width, target.client_rect.height),
@@ -311,13 +360,26 @@ def cmd_overlay(args: argparse.Namespace, config: MatchTileConfig) -> int:
     result = ReconstructionResult.load(result_path)
     title_regex = args.window or config.window_title_regex
     screen_offset = _offset_for_overlay(result.calibration, title_regex)
-    click_delay_s = 0.75
+    click_delay_s = config.click_delay_s
+    move_settle_s = config.move_settle_s
+    mouse_down_hold_s = config.mouse_down_hold_s
+    timing_jitter_s = config.timing_jitter_s
     with StopToken() as stop_token:
         if args.autoplay:
+            print(
+                "Overlay autoplay timing: "
+                f"delay {click_delay_s:.3f}s, "
+                f"settle {move_settle_s:.3f}s, "
+                f"hold {mouse_down_hold_s:.3f}s, "
+                f"jitter +/-{timing_jitter_s:.3f}s."
+            )
             clicked = auto_click_groups(
                 result_path,
                 min_confidence=args.autoplay_min_confidence or config.group_confidence_threshold,
                 click_delay_s=click_delay_s,
+                move_settle_s=move_settle_s,
+                mouse_down_hold_s=mouse_down_hold_s,
+                timing_jitter_s=timing_jitter_s,
                 verify=False,
                 include_ambiguous=args.include_ambiguous,
                 screen_offset=screen_offset,

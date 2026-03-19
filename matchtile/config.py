@@ -13,6 +13,10 @@ class MatchTileConfig:
     window_title_regex: str = r"Discord|NULL//TRANSMIT\.ERR"
     capture_fps: int = 18
     reveal_duration_s: float = 10.0
+    click_delay_s: float = 0.5
+    move_settle_s: float = 0.035
+    mouse_down_hold_s: float = 0.045
+    timing_jitter_s: float = 0.010
     frame_stability_threshold: float = 16.0
     tile_match_threshold: float = 0.78
     pair_confidence_threshold: float = 0.84

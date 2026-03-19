@@ -83,6 +83,51 @@ class Calibration:
 
 
 @dataclass(slots=True)
+class PhantomCell:
+    row: int
+    col: int
+    imgIdx: int
+    url: str
+
+
+@dataclass(slots=True)
+class PhantomBoard:
+    width: int
+    height: int
+    pairSize: int
+    startedAt: str | None
+    timestamp: str | None
+    reportedAt: int | None
+    remainingTime: int | None
+    grid: list[PhantomCell]
+
+    def to_dict(self) -> dict:
+        return {
+            "width": self.width,
+            "height": self.height,
+            "pairSize": self.pairSize,
+            "startedAt": self.startedAt,
+            "timestamp": self.timestamp,
+            "reportedAt": self.reportedAt,
+            "remainingTime": self.remainingTime,
+            "grid": [asdict(cell) for cell in self.grid],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "PhantomBoard":
+        return cls(
+            width=int(data["width"]),
+            height=int(data["height"]),
+            pairSize=int(data["pairSize"]),
+            startedAt=data.get("startedAt"),
+            timestamp=data.get("timestamp"),
+            reportedAt=data.get("reportedAt"),
+            remainingTime=data.get("remainingTime"),
+            grid=[PhantomCell(**entry) for entry in data.get("grid", [])],
+        )
+
+
+@dataclass(slots=True)
 class CellObservation:
     row: int
     col: int
@@ -94,6 +139,8 @@ class CellObservation:
     quality_score: float = 0.0
     visible_width_ratio: float = 0.0
     occupancy_ratio: float = 0.0
+    symbol_id: int | None = None
+    image_url: str | None = None
     alternate_candidates: list[dict] = field(default_factory=list)
     discarded_candidates: list[dict] = field(default_factory=list)
     timeline: list[dict] = field(default_factory=list)
@@ -127,6 +174,7 @@ class ReconstructionResult:
     grid_fit_debug_path: str | None = None
     candidate_debug_path: str | None = None
     solve_order_path: str | None = None
+    board_source: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -140,6 +188,7 @@ class ReconstructionResult:
             "grid_fit_debug_path": self.grid_fit_debug_path,
             "candidate_debug_path": self.candidate_debug_path,
             "solve_order_path": self.solve_order_path,
+            "board_source": self.board_source,
         }
 
     @classmethod
@@ -171,6 +220,7 @@ class ReconstructionResult:
             grid_fit_debug_path=data.get("grid_fit_debug_path"),
             candidate_debug_path=data.get("candidate_debug_path"),
             solve_order_path=data.get("solve_order_path"),
+            board_source=data.get("board_source"),
         )
 
     def save(self, path: Path) -> None:

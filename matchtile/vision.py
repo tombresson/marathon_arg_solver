@@ -55,18 +55,14 @@ def _board_rect_from_corners(corners: list[Point]) -> Rect:
 
 def manual_select_corners(
     image: np.ndarray,
-    rows: int,
-    cols: int,
     title: str = "Click board corners",
-) -> tuple[list[Point], int, int]:
+) -> list[Point]:
     window_name = title
     points: list[Point] = []
-    current_rows = max(1, int(rows))
-    current_cols = max(1, int(cols))
     instructions = [
         "Click inside this calibration image window.",
         "Click top-left, top-right, bottom-right, bottom-left.",
-        "After 4 corners: arrows adjust counts, Enter saves, Backspace undoes, R resets, Esc cancels.",
+        "After 4 corners: Enter saves, Backspace undoes, R resets, Esc cancels.",
     ]
 
     def focus_window() -> None:
@@ -99,30 +95,10 @@ def manual_select_corners(
 
     def redraw() -> None:
         canvas = image.copy()
-        calibration: Calibration | None = None
-        if len(points) == 4:
-            calibration = build_manual_calibration(
-                (image.shape[1], image.shape[0]),
-                rows=current_rows,
-                cols=current_cols,
-                corners=points,
-            )
-            canvas = _render_grid_fit_overlay(canvas, calibration)
         for index, line in enumerate(instructions):
             cv2.putText(canvas, line, (16, 30 + index * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2, cv2.LINE_AA)
         progress = f"Captured corners: {len(points)}/4"
         cv2.putText(canvas, progress, (16, 30 + len(instructions) * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2, cv2.LINE_AA)
-        count_line = f"Counts: {current_cols} cols x {current_rows} rows"
-        cv2.putText(
-            canvas,
-            count_line,
-            (16, 30 + (len(instructions) + 1) * 28),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.75,
-            (0, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
         labels = ["TL", "TR", "BR", "BL"]
         for index, point in enumerate(points):
             xy = (int(round(point.x)), int(round(point.y)))
@@ -153,7 +129,7 @@ def manual_select_corners(
         while True:
             key = cv2.waitKeyEx(20)
             if key in (13, 10, 32) and len(points) == 4:
-                return points.copy(), current_rows, current_cols
+                return points.copy()
             if key in (8, 127) and points:
                 removed = points.pop()
                 print(f"Removed last corner at ({int(round(removed.x))}, {int(round(removed.y))}).")
@@ -163,26 +139,6 @@ def manual_select_corners(
                     print("Resetting captured corners.")
                 points.clear()
                 redraw()
-            if len(points) == 4 and key == 2424832:
-                next_cols = max(1, current_cols - 1)
-                if next_cols != current_cols:
-                    current_cols = next_cols
-                    print(f"Columns set to {current_cols}.")
-                    redraw()
-            if len(points) == 4 and key == 2555904:
-                current_cols += 1
-                print(f"Columns set to {current_cols}.")
-                redraw()
-            if len(points) == 4 and key == 2490368:
-                current_rows += 1
-                print(f"Rows set to {current_rows}.")
-                redraw()
-            if len(points) == 4 and key == 2621440:
-                next_rows = max(1, current_rows - 1)
-                if next_rows != current_rows:
-                    current_rows = next_rows
-                    print(f"Rows set to {current_rows}.")
-                    redraw()
             if key == 27:
                 raise RuntimeError("Manual corner selection was cancelled.")
     finally:

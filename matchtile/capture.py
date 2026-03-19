@@ -22,7 +22,7 @@ class CaptureMetadata:
 
 
 def wait_for_hotkey(start_key: keyboard.Key = keyboard.Key.f8, stop_token: StopToken | None = None) -> None:
-    print(f"Press {start_key.name.upper()} to start capture. Press F12 to abort.")
+    print(f"Press {start_key.name.upper()} to start. Press F12 to abort.")
     started = False
 
     def on_press(key: keyboard.KeyCode | keyboard.Key) -> bool | None:
@@ -39,7 +39,7 @@ def wait_for_hotkey(start_key: keyboard.Key = keyboard.Key.f8, stop_token: StopT
                 break
             if stop_token:
                 stop_token.checkpoint()
-    print(f"{start_key.name.upper()} received. Starting reveal capture now.")
+    print(f"{start_key.name.upper()} received. Starting now.")
 
 
 def capture_frame(rect: Rect) -> np.ndarray:
