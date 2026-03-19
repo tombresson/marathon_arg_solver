@@ -20,7 +20,7 @@ class MatchTileConfig:
     window_title_regex: str = r"Discord|NULL//TRANSMIT\.ERR"
     capture_fps: int = 18
     reveal_duration_s: float = 32.0
-    click_delay_s: float = 0.75
+    click_delay_s: float = 0.5
     move_settle_s: float = 0.035
     mouse_down_hold_s: float = 0.045
     timing_jitter_s: float = 0.010

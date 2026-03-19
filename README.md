@@ -46,7 +46,7 @@ matchtile overlay --session sessions\20260319-013000 --window "NULL//TRANSMIT.ER
 - `replay --board-json` is still available for offline website-board debugging. `replay --session` uses `session\calibration.json` when present.
 - Use `--max-group-size <2-4>` on `replay`, `arm`, or `overlay` to cap inferred match-group size for a specific run.
 - `F12` is a global emergency stop for `arm`, overlay mode, and auto-click mode.
-- `arm --autoplay` clicks only high-confidence match groups by default and aborts if the post-click verification does not detect the expected board change.
+- `arm --autoplay` clicks only high-confidence match groups by default, samples each tile before and after clicking, skips groups when a click produces no visible board change, and keeps moving through the run instead of aborting the whole autoplay session.
 - Autoplay now uses a move-settle and mouse-hold click primitive by default: `click_delay_s = 0.25`, `move_settle_s = 0.035`, `mouse_down_hold_s = 0.045`, `timing_jitter_s = 0.010`.
 - Live capture sessions store `frames/`, `capture.json`, `calibration.json`, `result.json`, `grid_fit_debug.png`, `grid_composed.png`, `grid_debug.png`, `candidate_debug.png`, and `solve_order.txt` in `sessions/`.
 - `replay --board-json` still produces exact website-board sessions for offline debugging, while `replay --images` and `replay --session` continue to use the local image reconstruction pipeline.

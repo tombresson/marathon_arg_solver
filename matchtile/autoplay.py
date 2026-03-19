@@ -15,6 +15,10 @@ from matchtile.runtime_control import StopToken
 from matchtile.vision import cell_center, warp_image_to_board
 
 
+REFERENCE_CHANGE_THRESHOLD = 18.0
+POST_CLICK_CHANGE_THRESHOLD = 18.0
+
+
 def _jittered_delay(delay_s: float, jitter_s: float) -> float:
     return max(0.0, delay_s + random.uniform(-jitter_s, jitter_s))
 
@@ -55,7 +59,10 @@ def _capture_cell(result: ReconstructionResult, cell_id: str, capture_rect: tupl
         grabbed = sct.grab({"left": left, "top": top, "width": width, "height": height})
         frame = np.array(grabbed, dtype=np.uint8)[..., :3]
 
-    board = warp_image_to_board(frame, result.calibration, image_origin=screen_offset)
+    # The live grab is already in client-local coordinates because we capture exactly
+    # the Discord client rect. Saved calibration corners/centers are also client-local,
+    # so warping must use a zero origin here rather than screen space.
+    board = warp_image_to_board(frame, result.calibration, image_origin=(0, 0))
     obs = result.observations[cell_id]
     x = int(obs.col * result.calibration.pitch_x)
     y = int(obs.row * result.calibration.pitch_y)
@@ -67,19 +74,38 @@ def _capture_cell(result: ReconstructionResult, cell_id: str, capture_rect: tupl
     return crop
 
 
+def _load_reference_crop(result: ReconstructionResult, cell_id: str) -> np.ndarray | None:
+    obs = result.observations.get(cell_id)
+    if not obs or not obs.crop_path:
+        return None
+    reference = cv2.imread(obs.crop_path, cv2.IMREAD_COLOR)
+    if reference is None:
+        return None
+    return reference
+
+
+def _mean_delta(left: np.ndarray | None, right: np.ndarray | None) -> float | None:
+    if left is None or right is None:
+        return None
+    if left.shape[:2] != right.shape[:2]:
+        right = cv2.resize(right, (left.shape[1], left.shape[0]), interpolation=cv2.INTER_AREA)
+    return float(np.mean(np.abs(left.astype(np.float32) - right.astype(np.float32))))
+
+
+def _tile_unchanged_after_click(before: np.ndarray | None, after: np.ndarray | None) -> bool:
+    delta = _mean_delta(before, after)
+    return delta is not None and delta <= POST_CLICK_CHANGE_THRESHOLD
+
+
 def _verify_group_change(result: ReconstructionResult, group: MatchGroup, capture_rect: tuple[int, int, int, int], screen_offset: tuple[int, int]) -> bool:
     changed = 0
     for cell_id in group.members:
         current = _capture_cell(result, cell_id, capture_rect, screen_offset)
-        obs = result.observations.get(cell_id)
-        if current is None or not obs or not obs.crop_path:
+        reference = _load_reference_crop(result, cell_id)
+        if current is None or reference is None:
             continue
-        reference = cv2.imread(obs.crop_path, cv2.IMREAD_COLOR)
-        if reference is None:
-            continue
-        current = cv2.resize(current, (reference.shape[1], reference.shape[0]), interpolation=cv2.INTER_AREA)
-        delta = float(np.mean(np.abs(current.astype(np.float32) - reference.astype(np.float32))))
-        if delta > 18.0:
+        delta = _mean_delta(reference, current)
+        if delta is not None and delta > REFERENCE_CHANGE_THRESHOLD:
             changed += 1
     return changed == len(group.members)
 
@@ -113,15 +139,19 @@ def auto_click_groups(
     )
 
     clicked = 0
+    stale_skipped = 0
+    hard_failures = 0
     for group in groups:
         if stop_token:
             stop_token.checkpoint()
         click_sequence = group.click_order or group.members
-        print(f"{group.label} size {group.group_size}: ", end="", flush=True)
+        line_parts: list[str] = []
+        skip_reason: str | None = None
+        completed = False
         for cell_id in click_sequence:
+            before = _capture_cell(result, cell_id, capture_rect, screen_offset) if verify and capture_rect else None
             point = _cell_screen_point(result, cell_id, screen_offset)
-            is_last = cell_id == click_sequence[-1]
-            print(cell_id, end="\n" if is_last else " -> ", flush=True)
+            line_parts.append(cell_id)
             _execute_click(
                 controller,
                 point,
@@ -132,14 +162,39 @@ def auto_click_groups(
             )
             clicked += 1
             _sleep_with_stop(_jittered_delay(click_delay_s, timing_jitter_s), stop_token)
-        group_delay = _jittered_delay(click_delay_s, timing_jitter_s)
-        _sleep_with_stop(group_delay, stop_token)
-        if verify and capture_rect:
-            if not _verify_group_change(result, group, capture_rect, screen_offset):
-                raise RuntimeError(
-                    f"Auto-click verification failed on {group.label} "
-                    f"(size {group.group_size}); aborting further clicks."
-                )
+            if verify and capture_rect:
+                after = _capture_cell(result, cell_id, capture_rect, screen_offset)
+                if _tile_unchanged_after_click(before, after):
+                    skip_reason = f"SKIP no-change after {cell_id}"
+                    break
+        else:
+            completed = True
+
+        if completed:
+            group_delay = _jittered_delay(click_delay_s, timing_jitter_s)
+            _sleep_with_stop(group_delay, stop_token)
+            if verify and capture_rect and not _verify_group_change(result, group, capture_rect, screen_offset):
+                hard_failures += 1
+                skip_reason = f"WARN post-group-verify failed on {group.label}"
+        elif skip_reason:
+            stale_skipped += 1
+
+        joined = " -> ".join(line_parts)
+        if joined and skip_reason:
+            print(f"{group.label} size {group.group_size}: {joined} | {skip_reason}", flush=True)
+        elif joined:
+            print(f"{group.label} size {group.group_size}: {joined}", flush=True)
+        elif skip_reason:
+            print(f"{group.label} size {group.group_size}: {skip_reason}", flush=True)
+        else:
+            print(f"{group.label} size {group.group_size}: (no clicks)", flush=True)
+
+    if verify:
+        print(
+            f"Autoplay summary: clicked {clicked} tile(s), skipped {stale_skipped} stale group(s), "
+            f"hard failures {hard_failures}.",
+            flush=True,
+        )
     return clicked
 
 
