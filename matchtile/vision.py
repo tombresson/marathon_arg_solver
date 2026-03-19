@@ -6,10 +6,13 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import win32con
+import win32gui
 
 from matchtile.config import MatchTileConfig
 from matchtile.debug_grid import render_debug_grids
-from matchtile.models import Calibration, CellCenter, CellObservation, MatchGroup, Rect, ReconstructionResult
+from matchtile.models import Calibration, CellCenter, CellObservation, MatchGroup, Point, Rect, ReconstructionResult
+from matchtile.windowing import bring_window_to_front
 
 
 def load_image(path: str | Path) -> np.ndarray:
@@ -36,289 +39,197 @@ def manual_select_rect(image: np.ndarray, title: str = "Select board ROI") -> Re
     return Rect(int(x), int(y), int(width), int(height))
 
 
-def _artifact_mask(gray: np.ndarray) -> np.ndarray:
-    bright_threshold = max(120, int(np.quantile(gray, 0.995)))
-    mask = (gray >= bright_threshold).astype(np.uint8) * 255
-    if mask.any():
-        mask = cv2.dilate(mask, np.ones((11, 11), dtype=np.uint8), iterations=1)
-    return mask
+def _point_array(points: list[Point]) -> np.ndarray:
+    return np.array([[point.x, point.y] for point in points], dtype=np.float32)
 
 
-def _grid_maps(gray: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    artifact_mask = _artifact_mask(gray)
-    base = gray.astype(np.float32)
-    high_pass = cv2.GaussianBlur(base, (0, 0), 1.2) - cv2.GaussianBlur(base, (0, 0), 6.0)
-    high_pass = np.abs(high_pass)
-    high_pass[artifact_mask > 0] = 0
-
-    dots = cv2.GaussianBlur(base, (0, 0), 0.8) - cv2.GaussianBlur(base, (0, 0), 2.2)
-    dots = np.maximum(dots, 0)
-    dots[artifact_mask > 0] = 0
-
-    grad_x = np.abs(cv2.Sobel(high_pass, cv2.CV_32F, 1, 0, ksize=3))
-    grad_y = np.abs(cv2.Sobel(high_pass, cv2.CV_32F, 0, 1, ksize=3))
-    structure = np.minimum(cv2.blur(grad_x, (31, 31)), cv2.blur(grad_y, (31, 31))) + 0.6 * cv2.blur(dots, (17, 17))
-    return structure, dots, artifact_mask
+def _board_rect_from_corners(corners: list[Point]) -> Rect:
+    xs = [point.x for point in corners]
+    ys = [point.y for point in corners]
+    left = int(np.floor(min(xs)))
+    top = int(np.floor(min(ys)))
+    right = int(np.ceil(max(xs)))
+    bottom = int(np.ceil(max(ys)))
+    return Rect(left, top, max(right - left, 1), max(bottom - top, 1))
 
 
-def _aggregate_frames(images: list[np.ndarray]) -> np.ndarray:
-    if len(images) == 1:
-        return images[0].copy()
-    target_h, target_w = images[-1].shape[:2]
-    normalized = [
-        image if image.shape[:2] == (target_h, target_w) else cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_AREA)
-        for image in images
+def manual_select_corners(
+    image: np.ndarray,
+    rows: int,
+    cols: int,
+    title: str = "Click board corners",
+) -> tuple[list[Point], int, int]:
+    window_name = title
+    points: list[Point] = []
+    current_rows = max(1, int(rows))
+    current_cols = max(1, int(cols))
+    instructions = [
+        "Click inside this calibration image window.",
+        "Click top-left, top-right, bottom-right, bottom-left.",
+        "After 4 corners: arrows adjust counts, Enter saves, Backspace undoes, R resets, Esc cancels.",
     ]
-    stack = np.stack(normalized, axis=0)
-    return np.median(stack, axis=0).astype(np.uint8)
+
+    def focus_window() -> None:
+        try:
+            hwnd = win32gui.FindWindow(None, window_name)
+            if not hwnd:
+                return
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE,
+            )
+            bring_window_to_front(hwnd)
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE,
+            )
+        except Exception:
+            return
+
+    def redraw() -> None:
+        canvas = image.copy()
+        calibration: Calibration | None = None
+        if len(points) == 4:
+            calibration = build_manual_calibration(
+                (image.shape[1], image.shape[0]),
+                rows=current_rows,
+                cols=current_cols,
+                corners=points,
+            )
+            canvas = _render_grid_fit_overlay(canvas, calibration)
+        for index, line in enumerate(instructions):
+            cv2.putText(canvas, line, (16, 30 + index * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2, cv2.LINE_AA)
+        progress = f"Captured corners: {len(points)}/4"
+        cv2.putText(canvas, progress, (16, 30 + len(instructions) * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2, cv2.LINE_AA)
+        count_line = f"Counts: {current_cols} cols x {current_rows} rows"
+        cv2.putText(
+            canvas,
+            count_line,
+            (16, 30 + (len(instructions) + 1) * 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        labels = ["TL", "TR", "BR", "BL"]
+        for index, point in enumerate(points):
+            xy = (int(round(point.x)), int(round(point.y)))
+            cv2.circle(canvas, xy, 6, (0, 255, 0), -1)
+            cv2.putText(canvas, labels[index], (xy[0] + 8, xy[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+        if len(points) >= 2:
+            poly = np.array([[int(round(point.x)), int(round(point.y))] for point in points], dtype=np.int32)
+            cv2.polylines(canvas, [poly], False, (0, 255, 0), 2, cv2.LINE_AA)
+        if len(points) == 4:
+            poly = np.array([[int(round(point.x)), int(round(point.y))] for point in points], dtype=np.int32)
+            cv2.polylines(canvas, [poly], True, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.imshow(window_name, canvas)
+
+    def on_mouse(event: int, x: int, y: int, _flags: int, _param: object) -> None:
+        if event == cv2.EVENT_LBUTTONDOWN and len(points) < 4:
+            points.append(Point(float(x), float(y)))
+            labels = ["top-left", "top-right", "bottom-right", "bottom-left"]
+            print(f"Captured {labels[len(points) - 1]} corner at ({x}, {y}).")
+            redraw()
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(window_name, on_mouse)
+    redraw()
+    cv2.waitKey(1)
+    focus_window()
+    print("Calibration window is active. Click the four board corners inside that window.")
+    try:
+        while True:
+            key = cv2.waitKeyEx(20)
+            if key in (13, 10, 32) and len(points) == 4:
+                return points.copy(), current_rows, current_cols
+            if key in (8, 127) and points:
+                removed = points.pop()
+                print(f"Removed last corner at ({int(round(removed.x))}, {int(round(removed.y))}).")
+                redraw()
+            if key in (ord("r"), ord("R")):
+                if points:
+                    print("Resetting captured corners.")
+                points.clear()
+                redraw()
+            if len(points) == 4 and key == 2424832:
+                next_cols = max(1, current_cols - 1)
+                if next_cols != current_cols:
+                    current_cols = next_cols
+                    print(f"Columns set to {current_cols}.")
+                    redraw()
+            if len(points) == 4 and key == 2555904:
+                current_cols += 1
+                print(f"Columns set to {current_cols}.")
+                redraw()
+            if len(points) == 4 and key == 2490368:
+                current_rows += 1
+                print(f"Rows set to {current_rows}.")
+                redraw()
+            if len(points) == 4 and key == 2621440:
+                next_rows = max(1, current_rows - 1)
+                if next_rows != current_rows:
+                    current_rows = next_rows
+                    print(f"Rows set to {current_rows}.")
+                    redraw()
+            if key == 27:
+                raise RuntimeError("Manual corner selection was cancelled.")
+    finally:
+        cv2.destroyWindow(window_name)
 
 
-def _aggregate_grid_maps(images: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    if len(images) == 1:
-        gray = cv2.cvtColor(images[0], cv2.COLOR_BGR2GRAY)
-        structure, dots, _ = _grid_maps(gray)
-        return structure, dots
-    target_h, target_w = images[-1].shape[:2]
-    structures: list[np.ndarray] = []
-    dots_list: list[np.ndarray] = []
-    for image in images:
-        if image.shape[:2] != (target_h, target_w):
-            image = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_AREA)
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        structure, dots, _ = _grid_maps(gray)
-        structures.append(structure)
-        dots_list.append(dots)
-    return np.mean(structures, axis=0), np.mean(dots_list, axis=0)
+def _edge_length(left: Point, right: Point) -> float:
+    return float(np.hypot(right.x - left.x, right.y - left.y))
 
 
-def _span_mask(signal: np.ndarray, quantile: float, kernel_size: int) -> np.ndarray:
-    threshold = float(np.quantile(signal, quantile))
-    mask = (signal >= threshold).astype(np.uint8)
-    kernel = np.ones((max(kernel_size, 3),), dtype=np.uint8)
-    mask = cv2.morphologyEx(mask.reshape(1, -1), cv2.MORPH_CLOSE, kernel.reshape(1, -1), iterations=1).reshape(-1)
-    return mask
+def build_manual_calibration(
+    image_size: tuple[int, int],
+    rows: int,
+    cols: int,
+    corners: list[Point],
+    source: str = "manual-corners",
+) -> Calibration:
+    if len(corners) != 4:
+        raise ValueError("Manual calibration requires exactly 4 corners.")
+    image_width, image_height = image_size
+    board_rect = _board_rect_from_corners(corners)
+    top_len = _edge_length(corners[0], corners[1])
+    bottom_len = _edge_length(corners[3], corners[2])
+    left_len = _edge_length(corners[0], corners[3])
+    right_len = _edge_length(corners[1], corners[2])
+    pitch_x = max(12.0, (top_len + bottom_len) / max(2 * cols, 1))
+    pitch_y = max(12.0, (left_len + right_len) / max(2 * rows, 1))
+    rectified_width = max(int(round(pitch_x * cols)), cols)
+    rectified_height = max(int(round(pitch_y * rows)), rows)
+    pitch_x = rectified_width / max(cols, 1)
+    pitch_y = rectified_height / max(rows, 1)
 
-
-def _largest_span(mask: np.ndarray, minimum_length: int) -> tuple[int, int]:
-    indices = np.flatnonzero(mask)
-    if indices.size == 0:
-        return 0, mask.shape[0] - 1
-    if int(indices[-1] - indices[0] + 1) >= minimum_length:
-        return int(indices[0]), int(indices[-1])
-    start = int(indices[0])
-    best_start = start
-    best_end = start
-    prev = start
-    for idx in indices[1:]:
-        idx = int(idx)
-        if idx != prev + 1:
-            if prev - start > best_end - best_start:
-                best_start, best_end = start, prev
-            start = idx
-        prev = idx
-    if prev - start > best_end - best_start:
-        best_start, best_end = start, prev
-    if best_end - best_start + 1 < minimum_length:
-        return int(indices[0]), int(indices[-1])
-    return best_start, best_end
-
-
-def detect_board_rect_from_structure(structure: np.ndarray, restrict_left_bias: bool = False) -> Rect:
-    height, width = structure.shape[:2]
-    col_score = cv2.GaussianBlur(structure.mean(axis=0).reshape(1, -1), (0, 0), max(8.0, width / 180.0)).reshape(-1)
-    row_score = cv2.GaussianBlur(structure.mean(axis=1).reshape(-1, 1), (0, 0), max(8.0, height / 180.0)).reshape(-1)
-    if restrict_left_bias:
-        col_score[: int(width * 0.06)] = 0
-    col_mask = _span_mask(col_score, quantile=0.50, kernel_size=max(31, width // 50))
-    row_mask = _span_mask(row_score, quantile=0.50, kernel_size=max(31, height // 35))
-    x0, x1 = _largest_span(col_mask, minimum_length=max(width // 3, 200))
-    y0, y1 = _largest_span(row_mask, minimum_length=max(height // 4, 160))
-    pad_x = max(4, int(round((x1 - x0 + 1) * 0.002)))
-    pad_y = max(4, int(round((y1 - y0 + 1) * 0.002)))
-    x0 = max(x0 - pad_x, 0)
-    y0 = max(y0 - pad_y, 0)
-    x1 = min(x1 + pad_x, width - 1)
-    y1 = min(y1 + pad_y, height - 1)
-    return Rect(x0, y0, max(x1 - x0, 1), max(y1 - y0, 1))
-
-
-def detect_board_rect(image: np.ndarray, restrict_left_bias: bool = False) -> Rect:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    structure, _, _ = _grid_maps(gray)
-    return detect_board_rect_from_structure(structure, restrict_left_bias=restrict_left_bias)
-
-
-def _dominant_period(projection: np.ndarray, min_period: int = 12, max_period: int = 40) -> int:
-    signal = projection.astype(np.float32)
-    signal = signal - signal.mean()
-    best_period = min_period
-    best_score = float("-inf")
-    for period in range(min_period, max_period + 1):
-        if period >= signal.shape[0]:
-            break
-        score = float(np.dot(signal[:-period], signal[period:]))
-        if score > best_score:
-            best_score = score
-            best_period = period
-    return best_period
-
-
-def _best_phase(projection: np.ndarray, period: int) -> int:
-    best_phase = 0
-    best_score = float("-inf")
-    for phase in range(period):
-        score = float(projection[phase::period].sum())
-        if score > best_score:
-            best_score = score
-            best_phase = phase
-    return best_phase
-
-
-def _period_scores(projection: np.ndarray, min_period: int, max_period: int) -> dict[int, float]:
-    signal = projection.astype(np.float32)
-    signal = signal - signal.mean()
-    scores: dict[int, float] = {}
-    for period in range(min_period, max_period + 1):
-        if period >= signal.shape[0]:
-            break
-        scores[period] = float(np.dot(signal[:-period], signal[period:]))
-    return scores
-
-
-def _fundamental_period(projection: np.ndarray, min_period: int, max_period: int) -> float:
-    scores = _period_scores(projection, min_period=min_period, max_period=max_period)
-    if not scores:
-        return float(min_period)
-    best_period = max(scores, key=scores.get)
-    harmonic_candidates = [period for period in (best_period * 2 - 1, best_period * 2, best_period * 2 + 1) if period in scores]
-    if harmonic_candidates:
-        harmonic_period = max(harmonic_candidates, key=lambda period: scores[period])
-        if scores[harmonic_period] >= scores[best_period] * 0.78:
-            return float(harmonic_period)
-    return float(best_period)
-
-
-def _sample_axis_profile(signal: np.ndarray, positions: np.ndarray, sigma: float) -> tuple[float, float]:
-    values: list[float] = []
-    for position in positions:
-        low = max(int(np.floor(position - 3.0 * sigma)), 0)
-        high = min(int(np.ceil(position + 3.0 * sigma)) + 1, signal.shape[0])
-        if low >= high:
-            continue
-        coords = np.arange(low, high, dtype=np.float32)
-        weights = np.exp(-0.5 * ((coords - position) / sigma) ** 2)
-        values.append(float((signal[low:high] * weights).sum() / max(weights.sum(), 1e-6)))
-    if not values:
-        return 0.0, 0.0
-    return float(np.mean(values)), float(np.quantile(values, 0.25))
-
-
-def _score_axis_count(
-    dots_map: np.ndarray,
-    line_projection: np.ndarray,
-    count: int,
-    axis: str,
-    seed_pitches: tuple[float, ...],
-) -> tuple[float, float]:
-    length = dots_map.shape[1] if axis == "x" else dots_map.shape[0]
-    pitch = length / max(count, 1)
-    sigma = max(1.0, pitch * 0.12)
-    centers = (np.arange(count, dtype=np.float32) + 0.5) * pitch
-    boundaries = np.arange(count + 1, dtype=np.float32) * pitch
-
-    center_scores: list[float] = []
-    samples = np.linspace(0.15, 0.85, 8)
-    if axis == "x":
-        for fraction in samples:
-            row_index = int(round(fraction * (dots_map.shape[0] - 1)))
-            mean_value, lower_quartile = _sample_axis_profile(dots_map[row_index], centers, sigma)
-            center_scores.append(0.7 * mean_value + 0.3 * lower_quartile)
-    else:
-        for fraction in samples:
-            col_index = int(round(fraction * (dots_map.shape[1] - 1)))
-            mean_value, lower_quartile = _sample_axis_profile(dots_map[:, col_index], centers, sigma)
-            center_scores.append(0.7 * mean_value + 0.3 * lower_quartile)
-
-    line_mean, line_lower_quartile = _sample_axis_profile(line_projection, boundaries, sigma)
-    center_support = float(np.mean(center_scores)) if center_scores else 0.0
-    line_support = 0.7 * line_mean + 0.3 * line_lower_quartile
-    seed_support = max(
-        float(np.exp(-abs(pitch - seed_pitch) / max(2.0, seed_pitch * 0.20)))
-        for seed_pitch in seed_pitches
-        if seed_pitch > 0
+    destination_corners = np.array(
+        [[0.0, 0.0], [rectified_width, 0.0], [rectified_width, rectified_height], [0.0, rectified_height]],
+        dtype=np.float32,
     )
-    return 0.55 * center_support + 0.25 * line_support + 0.20 * seed_support, pitch
-
-
-def _choose_grid_counts_from_maps(structure: np.ndarray, dots: np.ndarray) -> tuple[int, int, float, float]:
-    dots_map = cv2.GaussianBlur(dots, (0, 0), 1.2)
-    line_x = cv2.GaussianBlur(structure.mean(axis=0).reshape(1, -1), (0, 0), 2.0).reshape(-1)
-    line_y = cv2.GaussianBlur(structure.mean(axis=1).reshape(-1, 1), (0, 0), 2.0).reshape(-1)
-
-    dominant_x = _fundamental_period(line_x, min_period=max(12, dots_map.shape[1] // 180), max_period=min(48, max(18, dots_map.shape[1] // 8)))
-    dominant_y = _fundamental_period(line_y, min_period=max(12, dots_map.shape[0] // 90), max_period=min(48, max(18, dots_map.shape[0] // 4)))
-    dense_seed_pitch_x = dominant_x * 0.90
-    dense_seed_pitch_y = dominant_y * 0.90
-    dense_seed_cols = max(2, int(round(dots_map.shape[1] / max(dense_seed_pitch_x, 1.0))))
-    dense_seed_rows = max(2, int(round(dots_map.shape[0] / max(dense_seed_pitch_y, 1.0))))
-
-    col_candidates = []
-    min_cols = max(2, dense_seed_cols - 3)
-    max_cols = dense_seed_cols + 3
-    for cols in range(min_cols, max_cols + 1):
-        score, pitch = _score_axis_count(
-            dots_map,
-            line_x,
-            cols,
-            axis="x",
-            seed_pitches=(dense_seed_pitch_x,),
-        )
-        col_candidates.append((cols, score, pitch))
-
-    row_candidates = []
-    min_rows = max(2, dense_seed_rows - 3)
-    max_rows = dense_seed_rows + 3
-    for rows in range(min_rows, max_rows + 1):
-        score, pitch = _score_axis_count(
-            dots_map,
-            line_y,
-            rows,
-            axis="y",
-            seed_pitches=(dense_seed_pitch_y,),
-        )
-        row_candidates.append((rows, score, pitch))
-
-    best_choice = None
-    best_score = float("-inf")
-    best_seed_distance = float("inf")
-    for cols, col_score, pitch_x in col_candidates:
-        for rows, row_score, pitch_y in row_candidates:
-            pitch_similarity = float(np.exp(-abs(pitch_x - pitch_y) / 4.0))
-            seed_distance = abs(cols - dense_seed_cols) + abs(rows - dense_seed_rows)
-            score = 0.5 * (col_score + row_score) + 0.25 * pitch_similarity - 0.03 * seed_distance
-            seed_distance = abs(cols - dense_seed_cols) + abs(rows - dense_seed_rows)
-            if score > best_score + 0.01 or (abs(score - best_score) <= 0.01 and seed_distance < best_seed_distance):
-                best_score = score
-                best_seed_distance = seed_distance
-                best_choice = (rows, cols, pitch_y, pitch_x)
-    if best_choice is None:
-        return dense_seed_rows, dense_seed_cols, dots_map.shape[0] / max(dense_seed_rows, 1), dots_map.shape[1] / max(dense_seed_cols, 1)
-    rows, cols, pitch_y, pitch_x = best_choice
-    return int(rows), int(cols), float(pitch_y), float(pitch_x)
-
-
-def _build_calibration(board_rect: Rect, rows: int, cols: int, pitch_y: float, pitch_x: float, source: str = "auto") -> Calibration:
-    offset_x = 0.0
-    offset_y = 0.0
-
-    centers: list[CellCenter] = []
-    for row in range(rows):
-        for col in range(cols):
-            center_x = board_rect.x + offset_x + (col + 0.5) * pitch_x
-            center_y = board_rect.y + offset_y + (row + 0.5) * pitch_y
-            if center_x >= board_rect.right or center_y >= board_rect.bottom:
-                continue
-            centers.append(CellCenter(row=row, col=col, x=center_x, y=center_y))
+    board_to_source = cv2.getPerspectiveTransform(destination_corners, _point_array(corners))
+    board_centers = np.array(
+        [[[(col + 0.5) * pitch_x, (row + 0.5) * pitch_y]] for row in range(rows) for col in range(cols)],
+        dtype=np.float32,
+    )
+    projected_centers = cv2.perspectiveTransform(board_centers, board_to_source).reshape(-1, 2)
+    centers = [
+        CellCenter(row=row, col=col, x=float(projected_centers[row * cols + col][0]), y=float(projected_centers[row * cols + col][1]))
+        for row in range(rows)
+        for col in range(cols)
+    ]
 
     return Calibration(
         board_rect=board_rect,
@@ -326,22 +237,101 @@ def _build_calibration(board_rect: Rect, rows: int, cols: int, pitch_y: float, p
         cols=cols,
         pitch_x=float(pitch_x),
         pitch_y=float(pitch_y),
-        offset_x=float(offset_x),
-        offset_y=float(offset_y),
+        offset_x=0.0,
+        offset_y=0.0,
+        board_corners=[Point(point.x, point.y) for point in corners],
+        client_width=int(image_width),
+        client_height=int(image_height),
+        rectified_width=int(rectified_width),
+        rectified_height=int(rectified_height),
         source=source,
         centers=centers,
     )
 
 
-def _choose_grid_counts(board_image: np.ndarray) -> tuple[int, int, float, float]:
-    gray = cv2.cvtColor(board_image, cv2.COLOR_BGR2GRAY)
-    structure, dots, _ = _grid_maps(gray)
-    return _choose_grid_counts_from_maps(structure, dots)
+def calibrate_grid(image: np.ndarray, rows: int, cols: int, corners: list[Point], source: str = "manual-corners") -> Calibration:
+    return build_manual_calibration((image.shape[1], image.shape[0]), rows=rows, cols=cols, corners=corners, source=source)
 
 
-def calibrate_grid(board_image: np.ndarray, board_rect: Rect, source: str = "auto") -> Calibration:
-    rows, cols, pitch_y, pitch_x = _choose_grid_counts(board_image)
-    return _build_calibration(board_rect, rows, cols, pitch_y, pitch_x, source=source)
+def _calibration_source_corners(calibration: Calibration, image_origin: tuple[int, int] = (0, 0)) -> np.ndarray:
+    origin_x, origin_y = image_origin
+    return np.array(
+        [[point.x - origin_x, point.y - origin_y] for point in calibration.board_corners],
+        dtype=np.float32,
+    )
+
+
+def _board_destination_corners(calibration: Calibration) -> np.ndarray:
+    return np.array(
+        [
+            [0.0, 0.0],
+            [float(calibration.rectified_width), 0.0],
+            [float(calibration.rectified_width), float(calibration.rectified_height)],
+            [0.0, float(calibration.rectified_height)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def warp_image_to_board(image: np.ndarray, calibration: Calibration, image_origin: tuple[int, int] = (0, 0)) -> np.ndarray:
+    source = _calibration_source_corners(calibration, image_origin=image_origin)
+    destination = _board_destination_corners(calibration)
+    matrix = cv2.getPerspectiveTransform(source, destination)
+    return cv2.warpPerspective(image, matrix, (calibration.rectified_width, calibration.rectified_height))
+
+
+def project_board_points(
+    calibration: Calibration,
+    board_points: np.ndarray,
+    image_origin: tuple[int, int] = (0, 0),
+) -> np.ndarray:
+    source = _calibration_source_corners(calibration, image_origin=image_origin)
+    destination = _board_destination_corners(calibration)
+    matrix = cv2.getPerspectiveTransform(destination, source)
+    points = np.asarray(board_points, dtype=np.float32).reshape(-1, 1, 2)
+    return cv2.perspectiveTransform(points, matrix).reshape(-1, 2)
+
+
+def cell_polygon(calibration: Calibration, row: int, col: int, image_origin: tuple[int, int] = (0, 0)) -> np.ndarray:
+    x0 = col * calibration.pitch_x
+    y0 = row * calibration.pitch_y
+    polygon = np.array(
+        [
+            [x0, y0],
+            [x0 + calibration.pitch_x, y0],
+            [x0 + calibration.pitch_x, y0 + calibration.pitch_y],
+            [x0, y0 + calibration.pitch_y],
+        ],
+        dtype=np.float32,
+    )
+    return project_board_points(calibration, polygon, image_origin=image_origin)
+
+
+def cell_center(calibration: Calibration, row: int, col: int) -> tuple[float, float]:
+    index = row * calibration.cols + col
+    center = calibration.centers[index]
+    return center.x, center.y
+
+
+def offset_calibration(calibration: Calibration, dx: float, dy: float) -> Calibration:
+    shifted_corners = [Point(point.x + dx, point.y + dy) for point in calibration.board_corners]
+    shifted_centers = [CellCenter(row=center.row, col=center.col, x=center.x + dx, y=center.y + dy) for center in calibration.centers]
+    return Calibration(
+        board_rect=Rect(calibration.board_rect.x + int(round(dx)), calibration.board_rect.y + int(round(dy)), calibration.board_rect.width, calibration.board_rect.height),
+        rows=calibration.rows,
+        cols=calibration.cols,
+        pitch_x=calibration.pitch_x,
+        pitch_y=calibration.pitch_y,
+        offset_x=calibration.offset_x,
+        offset_y=calibration.offset_y,
+        board_corners=shifted_corners,
+        client_width=calibration.client_width,
+        client_height=calibration.client_height,
+        rectified_width=calibration.rectified_width,
+        rectified_height=calibration.rectified_height,
+        source=calibration.source,
+        centers=shifted_centers,
+    )
 
 
 def _cell_crop(image: np.ndarray, calibration: Calibration, row: int, col: int, inset: float = 0.18) -> np.ndarray | None:
@@ -393,54 +383,67 @@ def compare_features(left: TileFeature, right: TileFeature) -> float:
     return float(np.clip(np.dot(left.descriptor, right.descriptor), 0.0, 1.0))
 
 
-def _select_calibration_images(images: list[np.ndarray]) -> list[np.ndarray]:
-    if len(images) <= 12:
-        return images
-    return images[-12:]
-
-
-def render_grid_fit_debug(image: np.ndarray, calibration: Calibration, output_path: Path) -> Path:
+def _render_grid_fit_overlay(image: np.ndarray, calibration: Calibration) -> np.ndarray:
     overlay = image.copy()
-    board = calibration.board_rect
-    cv2.rectangle(overlay, (board.x, board.y), (board.right, board.bottom), (0, 255, 0), 2)
-
+    board_polygon = np.array(
+        [[int(round(point.x)), int(round(point.y))] for point in calibration.board_corners],
+        dtype=np.int32,
+    )
+    cv2.polylines(overlay, [board_polygon], True, (0, 255, 0), 2, cv2.LINE_AA)
     for col in range(calibration.cols + 1):
-        x = int(round(board.x + col * calibration.pitch_x))
-        cv2.line(overlay, (x, board.y), (x, board.bottom), (0, 255, 0), 1)
+        top, bottom = project_board_points(
+            calibration,
+            np.array([[col * calibration.pitch_x, 0.0], [col * calibration.pitch_x, calibration.rectified_height]], dtype=np.float32),
+        )
+        cv2.line(
+            overlay,
+            (int(round(top[0])), int(round(top[1]))),
+            (int(round(bottom[0])), int(round(bottom[1]))),
+            (0, 255, 0),
+            1,
+            cv2.LINE_AA,
+        )
     for row in range(calibration.rows + 1):
-        y = int(round(board.y + row * calibration.pitch_y))
-        cv2.line(overlay, (board.x, y), (board.right, y), (0, 255, 0), 1)
+        left, right = project_board_points(
+            calibration,
+            np.array([[0.0, row * calibration.pitch_y], [calibration.rectified_width, row * calibration.pitch_y]], dtype=np.float32),
+        )
+        cv2.line(
+            overlay,
+            (int(round(left[0])), int(round(left[1]))),
+            (int(round(right[0])), int(round(right[1]))),
+            (0, 255, 0),
+            1,
+            cv2.LINE_AA,
+        )
 
     label = (
         f"{calibration.cols} cols x {calibration.rows} rows | "
         f"pitch {calibration.pitch_x:.2f} x {calibration.pitch_y:.2f}"
     )
-    cv2.putText(overlay, label, (board.x, max(24, board.y - 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+    label_x = calibration.board_rect.x
+    label_y = max(24, calibration.board_rect.y - 12)
+    cv2.putText(overlay, label, (label_x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+    return overlay
+
+
+def render_grid_fit_debug(image: np.ndarray, calibration: Calibration, output_path: Path) -> Path:
+    overlay = _render_grid_fit_overlay(image, calibration)
     cv2.imwrite(str(output_path), overlay)
     return output_path
 
 
-def reconstruct_from_images(image_paths: list[Path], session_dir: Path, config: MatchTileConfig, board_rect_override: Rect | None = None) -> ReconstructionResult:
+def reconstruct_from_images(
+    image_paths: list[Path],
+    session_dir: Path,
+    config: MatchTileConfig,
+    calibration: Calibration,
+) -> ReconstructionResult:
     images = [load_image(path) for path in image_paths]
     if not images:
         raise ValueError("No images provided for reconstruction.")
 
-    calibration_images = _select_calibration_images(images)
-    calibration_image = calibration_images[-1]
-    if board_rect_override:
-        board_rect = board_rect_override
-        calibration = calibrate_grid(crop_rect(calibration_image, board_rect), board_rect)
-    else:
-        aggregate_structure, aggregate_dots = _aggregate_grid_maps(calibration_images)
-        activity_rect = detect_discord_activity_region(calibration_image)
-        activity_structure = aggregate_structure[activity_rect.y : activity_rect.bottom, activity_rect.x : activity_rect.right]
-        activity_dots = aggregate_dots[activity_rect.y : activity_rect.bottom, activity_rect.x : activity_rect.right]
-        board_local_rect = detect_board_rect_from_structure(activity_structure, restrict_left_bias=False)
-        board_rect = Rect(activity_rect.x + board_local_rect.x, activity_rect.y + board_local_rect.y, board_local_rect.width, board_local_rect.height)
-        board_structure = activity_structure[board_local_rect.y : board_local_rect.bottom, board_local_rect.x : board_local_rect.right]
-        board_dots = activity_dots[board_local_rect.y : board_local_rect.bottom, board_local_rect.x : board_local_rect.right]
-        rows, cols, pitch_y, pitch_x = _choose_grid_counts_from_maps(board_structure, board_dots)
-        calibration = _build_calibration(board_rect, rows, cols, pitch_y, pitch_x)
+    calibration_image = images[0]
     observations: dict[str, CellObservation] = {}
     features: dict[str, TileFeature] = {}
 
@@ -448,9 +451,7 @@ def reconstruct_from_images(image_paths: list[Path], session_dir: Path, config: 
     crops_dir.mkdir(parents=True, exist_ok=True)
 
     for frame_index, frame in enumerate(images):
-        current_board = crop_rect(frame, board_rect)
-        if current_board.shape[:2] != (board_rect.height, board_rect.width):
-            current_board = cv2.resize(current_board, (board_rect.width, board_rect.height), interpolation=cv2.INTER_AREA)
+        current_board = warp_image_to_board(frame, calibration)
 
         sat_scores: list[float] = []
         val_scores: list[float] = []
@@ -668,9 +669,9 @@ def infer_match_groups(features: dict[str, TileFeature], config: MatchTileConfig
     return groups, unresolved
 
 
-def reconstruct_from_session(session_dir: Path, config: MatchTileConfig, board_rect_override: Rect | None = None) -> ReconstructionResult:
+def reconstruct_from_session(session_dir: Path, config: MatchTileConfig, calibration: Calibration) -> ReconstructionResult:
     frames_dir = session_dir / "frames"
     image_paths = sorted(frames_dir.glob("*.png"))
-    result = reconstruct_from_images(image_paths, session_dir=session_dir, config=config, board_rect_override=board_rect_override)
+    result = reconstruct_from_images(image_paths, session_dir=session_dir, config=config, calibration=calibration)
     result.save(session_dir / "result.json")
     return result

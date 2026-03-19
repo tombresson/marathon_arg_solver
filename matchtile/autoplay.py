@@ -10,12 +10,14 @@ from pynput.mouse import Button, Controller
 
 from matchtile.models import MatchGroup, ReconstructionResult
 from matchtile.runtime_control import StopToken
+from matchtile.vision import cell_center, warp_image_to_board
 
 
 def _cell_screen_point(result: ReconstructionResult, cell_id: str, screen_offset: tuple[int, int]) -> tuple[int, int]:
     obs = result.observations[cell_id]
-    x = result.calibration.board_rect.x + screen_offset[0] + result.calibration.offset_x + (obs.col + 0.5) * result.calibration.pitch_x
-    y = result.calibration.board_rect.y + screen_offset[1] + result.calibration.offset_y + (obs.row + 0.5) * result.calibration.pitch_y
+    x, y = cell_center(result.calibration, obs.row, obs.col)
+    x += screen_offset[0]
+    y += screen_offset[1]
     return int(round(x)), int(round(y))
 
 
@@ -25,14 +27,13 @@ def _capture_cell(result: ReconstructionResult, cell_id: str, capture_rect: tupl
         grabbed = sct.grab({"left": left, "top": top, "width": width, "height": height})
         frame = np.array(grabbed, dtype=np.uint8)[..., :3]
 
+    board = warp_image_to_board(frame, result.calibration, image_origin=screen_offset)
     obs = result.observations[cell_id]
-    board_x = result.calibration.board_rect.x + screen_offset[0] - left
-    board_y = result.calibration.board_rect.y + screen_offset[1] - top
-    x = int(board_x + result.calibration.offset_x + obs.col * result.calibration.pitch_x)
-    y = int(board_y + result.calibration.offset_y + obs.row * result.calibration.pitch_y)
+    x = int(obs.col * result.calibration.pitch_x)
+    y = int(obs.row * result.calibration.pitch_y)
     w = int(result.calibration.pitch_x)
     h = int(result.calibration.pitch_y)
-    crop = frame[max(y, 0) : min(y + h, height), max(x, 0) : min(x + w, width)]
+    crop = board[max(y, 0) : min(y + h, board.shape[0]), max(x, 0) : min(x + w, board.shape[1])]
     if crop.size == 0:
         return None
     return crop

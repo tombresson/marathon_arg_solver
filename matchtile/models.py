@@ -33,6 +33,12 @@ class CellCenter:
 
 
 @dataclass(slots=True)
+class Point:
+    x: float
+    y: float
+
+
+@dataclass(slots=True)
 class Calibration:
     board_rect: Rect
     rows: int
@@ -41,7 +47,12 @@ class Calibration:
     pitch_y: float
     offset_x: float
     offset_y: float
-    source: str = "auto"
+    board_corners: list[Point] = field(default_factory=list)
+    client_width: int = 0
+    client_height: int = 0
+    rectified_width: int = 0
+    rectified_height: int = 0
+    source: str = "manual-corners"
     centers: list[CellCenter] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -52,8 +63,23 @@ class Calibration:
     @classmethod
     def from_dict(cls, data: dict) -> "Calibration":
         centers = [CellCenter(**entry) for entry in data.get("centers", [])]
-        rest = {k: v for k, v in data.items() if k not in {"board_rect", "centers"}}
-        return cls(board_rect=Rect(**data["board_rect"]), centers=centers, **rest)
+        raw_corners = data.get("board_corners")
+        if raw_corners:
+            board_corners = [Point(**entry) for entry in raw_corners]
+        else:
+            rect = Rect(**data["board_rect"])
+            board_corners = [
+                Point(float(rect.x), float(rect.y)),
+                Point(float(rect.right), float(rect.y)),
+                Point(float(rect.right), float(rect.bottom)),
+                Point(float(rect.x), float(rect.bottom)),
+            ]
+        rest = {k: v for k, v in data.items() if k not in {"board_rect", "centers", "board_corners"}}
+        rest.setdefault("client_width", data["board_rect"]["width"])
+        rest.setdefault("client_height", data["board_rect"]["height"])
+        rest.setdefault("rectified_width", max(int(round(rest.get("pitch_x", 0.0) * rest.get("cols", 0))), 0))
+        rest.setdefault("rectified_height", max(int(round(rest.get("pitch_y", 0.0) * rest.get("rows", 0))), 0))
+        return cls(board_rect=Rect(**data["board_rect"]), board_corners=board_corners, centers=centers, **rest)
 
 
 @dataclass(slots=True)

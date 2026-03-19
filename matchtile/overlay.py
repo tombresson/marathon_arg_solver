@@ -14,6 +14,7 @@ from pynput import mouse
 from matchtile.config import MatchTileConfig
 from matchtile.models import MatchGroup, ReconstructionResult
 from matchtile.runtime_control import StopToken
+from matchtile.vision import cell_center, cell_polygon, warp_image_to_board
 
 
 @dataclass(slots=True)
@@ -51,6 +52,7 @@ class OverlayWidget(QtWidgets.QWidget):
             self._kill_timer = QtCore.QTimer(self)
             self._kill_timer.timeout.connect(self._check_stop_requested)
             self._kill_timer.start(50)
+        self._center_lookup = {(center.row, center.col): (center.x, center.y) for center in result.calibration.centers}
 
     def _matching_groups(self, selected: list[str]) -> list[MatchGroup]:
         selected_set = set(selected)
@@ -70,9 +72,7 @@ class OverlayWidget(QtWidgets.QWidget):
 
     def _cell_center(self, cell_id: str) -> tuple[float, float]:
         obs = self.result.observations[cell_id]
-        x = self.result.calibration.offset_x + (obs.col + 0.5) * self.result.calibration.pitch_x
-        y = self.result.calibration.offset_y + (obs.row + 0.5) * self.result.calibration.pitch_y
-        return x, y
+        return self._center_lookup[(obs.row, obs.col)]
 
     def _nearest_cell(self, global_x: int, global_y: int) -> str | None:
         rect = self.result.calibration.board_rect
@@ -84,7 +84,7 @@ class OverlayWidget(QtWidgets.QWidget):
         best_dist = float("inf")
         for cell_id in self.result.observations:
             cx, cy = self._cell_center(cell_id)
-            dist = (cx - local_x) ** 2 + (cy - local_y) ** 2
+            dist = ((cx - rect.x) - local_x) ** 2 + ((cy - rect.y) - local_y) ** 2
             if dist < best_dist:
                 best_dist = dist
                 best_cell = cell_id
@@ -115,12 +115,7 @@ class OverlayWidget(QtWidgets.QWidget):
         with mss.mss() as sct:
             grabbed = sct.grab({"left": left, "top": top, "width": width, "height": height})
             frame = np.array(grabbed, dtype=np.uint8)[..., :3]
-        global_board_x = self.result.calibration.board_rect.x + self.screen_offset[0]
-        global_board_y = self.result.calibration.board_rect.y + self.screen_offset[1]
-        board = frame[
-            global_board_y - top : global_board_y - top + self.result.calibration.board_rect.height,
-            global_board_x - left : global_board_x - left + self.result.calibration.board_rect.width,
-        ]
+        board = warp_image_to_board(frame, self.result.calibration, image_origin=self.screen_offset)
         changed: list[str] = []
         for cell_id in group.members:
             obs = self.result.observations.get(cell_id)
@@ -129,8 +124,8 @@ class OverlayWidget(QtWidgets.QWidget):
             reference = cv2.imread(obs.crop_path, cv2.IMREAD_COLOR)
             if reference is None:
                 continue
-            x = int(self.result.calibration.offset_x + obs.col * self.result.calibration.pitch_x)
-            y = int(self.result.calibration.offset_y + obs.row * self.result.calibration.pitch_y)
+            x = int(obs.col * self.result.calibration.pitch_x)
+            y = int(obs.row * self.result.calibration.pitch_y)
             w = int(self.result.calibration.pitch_x)
             h = int(self.result.calibration.pitch_y)
             current = board[max(y, 0) : min(y + h, board.shape[0]), max(x, 0) : min(x + w, board.shape[1])]
@@ -166,13 +161,21 @@ class OverlayWidget(QtWidgets.QWidget):
                 obs = self.result.observations.get(cell_id)
                 if not obs:
                     continue
-                x = self.result.calibration.offset_x + obs.col * self.result.calibration.pitch_x
-                y = self.result.calibration.offset_y + obs.row * self.result.calibration.pitch_y
-                rect = QtCore.QRectF(x + 2, y + 2, self.result.calibration.pitch_x - 4, self.result.calibration.pitch_y - 4)
+                polygon = cell_polygon(
+                    self.result.calibration,
+                    obs.row,
+                    obs.col,
+                    image_origin=(self.result.calibration.board_rect.x, self.result.calibration.board_rect.y),
+                )
+                qpoints = [QtCore.QPointF(float(point[0]), float(point[1])) for point in polygon]
+                qpolygon = QtGui.QPolygonF(qpoints)
                 painter.setBrush(fill)
-                painter.drawRoundedRect(rect, 5, 5)
+                painter.drawPolygon(qpolygon)
                 painter.setPen(QtGui.QColor("black"))
-                painter.drawText(rect, QtCore.Qt.AlignmentFlag.AlignCenter, f"{group.label[1:]}/{group.group_size}")
+                center_x, center_y = cell_center(self.result.calibration, obs.row, obs.col)
+                center_point = QtCore.QPointF(center_x - self.result.calibration.board_rect.x, center_y - self.result.calibration.board_rect.y)
+                text_rect = QtCore.QRectF(center_point.x() - 14, center_point.y() - 10, 28, 20)
+                painter.drawText(text_rect, QtCore.Qt.AlignmentFlag.AlignCenter, f"{group.label[1:]}/{group.group_size}")
                 painter.setPen(QtCore.Qt.PenStyle.NoPen)
 
         if self.selection.cells:
@@ -184,10 +187,14 @@ class OverlayWidget(QtWidgets.QWidget):
                 obs = self.result.observations.get(cell_id)
                 if not obs:
                     continue
-                x = self.result.calibration.offset_x + obs.col * self.result.calibration.pitch_x
-                y = self.result.calibration.offset_y + obs.row * self.result.calibration.pitch_y
-                rect = QtCore.QRectF(x + 1, y + 1, self.result.calibration.pitch_x - 2, self.result.calibration.pitch_y - 2)
-                painter.drawRoundedRect(rect, 6, 6)
+                polygon = cell_polygon(
+                    self.result.calibration,
+                    obs.row,
+                    obs.col,
+                    image_origin=(self.result.calibration.board_rect.x, self.result.calibration.board_rect.y),
+                )
+                qpolygon = QtGui.QPolygonF([QtCore.QPointF(float(point[0]), float(point[1])) for point in polygon])
+                painter.drawPolygon(qpolygon)
 
         painter.setPen(QtGui.QColor("#FFFFFF"))
         painter.setBrush(QtGui.QColor(10, 10, 10, 180))

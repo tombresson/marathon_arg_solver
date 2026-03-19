@@ -19,6 +19,7 @@ class MatchTileConfig:
     group_confidence_threshold: float = 0.84
     max_group_size: int = 4
     session_output_dir: str = "sessions"
+    calibration_dir: str = "calibrations"
     overlay_palette: list[str] = field(
         default_factory=lambda: [
             "#4CC9F0",

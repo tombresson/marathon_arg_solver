@@ -1,5 +1,6 @@
 .venv
 __pycache__/
 sessions/
+calibrations/
 *.calibration.json
 matchtile.json
