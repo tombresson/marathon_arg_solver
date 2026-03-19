@@ -1,0 +1,25 @@
+[project]
+name = "matchtile"
+version = "0.1.0"
+description = "Discord Match Tile assistant for calibration, replay reconstruction, and overlay guidance."
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "mss>=10.1.0",
+  "numpy>=2.4.0",
+  "opencv-python>=4.13.0",
+  "Pillow>=12.1.0",
+  "pynput>=1.8.1",
+  "PySide6>=6.10.2",
+  "pywin32>=311",
+]
+
+[project.scripts]
+matchtile = "matchtile.cli:main"
+
+[build-system]
+requires = ["setuptools>=80", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["matchtile*"]
